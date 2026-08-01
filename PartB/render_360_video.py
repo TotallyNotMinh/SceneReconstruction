@@ -117,8 +117,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         ply_file = sys.argv[1]
     else:
-        # Example default path once downloaded
-        ply_file = r"C:\replica\room_0\mesh.ply"
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        default_mesh = os.path.join(script_dir, "..", "Replica-Dataset", "room_0", "mesh.ply")
+        ply_file = default_mesh if os.path.exists(default_mesh) else os.path.join("Replica-Dataset", "room_0", "mesh.ply")
 
     output_mp4 = "replica_room0_360.mp4"
     render_replica_360(ply_file, output_mp4)

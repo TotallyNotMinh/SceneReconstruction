@@ -10,8 +10,11 @@ from PIL import Image
 from ultralytics import YOLO
 from tqdm import tqdm
 
+# Script directory for relative paths
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Output base directory
-OUTPUT_BASE_DIR = r"C:\Users\Zephyrus\Documents\SceneReconstruction\reid_objects_output"
+OUTPUT_BASE_DIR = os.path.join(SCRIPT_DIR, "reid_objects_output")
 SEGMENTED_DIR = os.path.join(OUTPUT_BASE_DIR, "segmented")
 BBOX_UNCLIPPED_DIR = os.path.join(OUTPUT_BASE_DIR, "bbox_unclipped")
 TRACKED_VIDEO_PATH = os.path.join(OUTPUT_BASE_DIR, "demo_tracked.mp4")
@@ -24,7 +27,7 @@ MIN_CROP_SIZE = 100           # Minimum px size to ignore noise
 # Furniture classes in COCO
 TARGET_CLASSES = {
     'chair', 'couch', 'bed', 'dining table', 'tv', 'refrigerator',
- 'oven'}
+    'oven'}
 
 
 def get_color(identifier):
@@ -41,8 +44,12 @@ def process_video_or_folder(input_path):
     if device == "cuda":
         print(f"[+] GPU Name: {torch.cuda.get_device_name(0)}")
 
-    print("[+] Loading YOLO11 Medium Segmentation model (yolo11m-seg.pt) with BoT-SORT tracking...")
-    yolo_model = YOLO("yolo11m-seg.pt")
+    model_path = os.path.join(SCRIPT_DIR, "yolo11m-seg.pt")
+    if not os.path.exists(model_path):
+        model_path = "yolo11m-seg.pt"
+
+    print(f"[+] Loading YOLO11 Medium Segmentation model ({model_path}) with BoT-SORT tracking...")
+    yolo_model = YOLO(model_path)
 
     print("[+] Loading DINOv2 Small feature extractor (dinov2_vits14)...")
     dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').to(device)
@@ -282,7 +289,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         target_path = sys.argv[1]
     else:
-        target_path = "demo.mp4"
+        demo_in_script_dir = os.path.join(SCRIPT_DIR, "demo.mp4")
+        target_path = demo_in_script_dir if os.path.exists(demo_in_script_dir) else "demo.mp4"
 
     process_video_or_folder(target_path)
 
