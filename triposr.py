@@ -1,2 +1,0 @@
-def triposr():
-    pass

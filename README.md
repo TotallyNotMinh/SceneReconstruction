@@ -59,6 +59,11 @@ pip install -r PartA/requirements.txt
 
 # Part B (video Re-ID pipeline)
 pip install ultralytics torch torchvision opencv-python tqdm Pillow
+
+# Part C (Construct 3D objects from image)
+cd SceneReconstruction/PartC
+chmod +x setup.sh
+./setup.sh
 ```
 
 ### 3 — Download a Replica scene

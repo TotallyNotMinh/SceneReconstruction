@@ -56,3 +56,5 @@ PartB/reid_objects_output/
 # Logs / misc
 *.log
 *.tmp
+# Outputs file for now
+*.obj
