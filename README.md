@@ -88,15 +88,16 @@ python PartA/synthesize_replica_data.py Replica-Dataset\room_0\mesh.ply
 
 This produces everything Part A needs inside `PartA/data/`:
 
-| File | Description |
-|---|---|
-| `ar_metadata.json` | 120 synthetic ARKit camera poses (360° orbit) |
-| `world_pointcloud.ply` | 80 k-point surface sample, voxel-cleaned |
-| `room_layout.obj` | Floor slab geometry for RANSAC detection |
-| `detections_from_b.json` | Per-object 2D bounding boxes per frame |
-| `meshes_from_c/*.obj` | Axis-aligned proxy mesh per furniture cluster |
+| File                     | Description                                   |
+|--------------------------|-----------------------------------------------|
+| `ar_metadata.json`       | 120 synthetic ARKit camera poses (360° orbit) |
+| `world_pointcloud.ply`   | 80 k-point surface sample, voxel-cleaned      |
+| `room_layout.obj`        | Floor slab geometry for RANSAC detection      |
+| `detections_from_b.json` | Per-object 2D bounding boxes per frame        |
+| `meshes_from_c/*.obj`    | Axis-aligned proxy mesh per furniture cluster |
 
-### 5 — Run Part A (3D spatial engine)
+### 5 - How to run
+#### 5.1 — Run Part A (3D spatial engine)
 
 ```powershell
 python PartA/main_pipeline.py
@@ -104,7 +105,7 @@ python PartA/main_pipeline.py
 
 Output: `PartA/data/output/digital_twin_scene.glb`
 
-### 6 — Run Part B (video Re-ID pipeline)
+#### 5.2 — Run Part B (video Re-ID pipeline)
 
 Place your input video at `PartB/demo.mp4`, then:
 
@@ -114,13 +115,23 @@ python PartB/reid_pipeline.py
 
 Outputs land in `PartB/reid_objects_output/`:
 
-| Path | Description |
-|---|---|
-| `reid_objects_output/demo_tracked.mp4` | Annotated tracking video |
-| `reid_objects_output/segmented/` | Per-object segmentation crops |
-| `reid_objects_output/bbox_unclipped/` | Full-frame annotated stills |
+#### 5.3 - Run Part C (Construct 3D objects from image)
 
-### 7 — (Optional) Render 360° video from Replica
+Execute :
+
+``` powershell
+python PartC/main.py
+```
+Output: 'PartC/outputs'
+
+
+| Path                                   | Description                   |
+|----------------------------------------|-------------------------------|
+| `reid_objects_output/demo_tracked.mp4` | Annotated tracking video      |
+| `reid_objects_output/segmented/`       | Per-object segmentation crops |
+| `reid_objects_output/bbox_unclipped/`  | Full-frame annotated stills   |
+
+### 6 — (Optional) Render 360° video from Replica
 
 ```powershell
 python PartB/render_360_video.py
@@ -130,17 +141,17 @@ python PartB/render_360_video.py
 
 ## Dependencies at a Glance
 
-| Package | Used by | Purpose |
-|---|---|---|
-| `open3d` | Part A | Point cloud I/O, voxel sampling, outlier removal |
-| `trimesh` | Part A | Mesh loading, surface sampling, proxy mesh export |
-| `scikit-learn` | Part A | DBSCAN clustering, PCA OBB |
-| `scipy` | Part A | Spatial transforms |
-| `pydantic` | Part A | Config validation |
-| `ultralytics` | Part B | YOLO11m-seg detection |
-| `torch` + `torchvision` | Part B | Re-ID feature embeddings |
-| `opencv-python` | Part B | Video I/O, frame processing |
-| `tqdm` | Part B | Progress bars |
+| Package                 | Used by | Purpose                                           |
+|-------------------------|---------|---------------------------------------------------|
+| `open3d`                | Part A  | Point cloud I/O, voxel sampling, outlier removal  |
+| `trimesh`               | Part A  | Mesh loading, surface sampling, proxy mesh export |
+| `scikit-learn`          | Part A  | DBSCAN clustering, PCA OBB                        |
+| `scipy`                 | Part A  | Spatial transforms                                |
+| `pydantic`              | Part A  | Config validation                                 |
+| `ultralytics`           | Part B  | YOLO11m-seg detection                             |
+| `torch` + `torchvision` | Part B  | Re-ID feature embeddings                          |
+| `opencv-python`         | Part B  | Video I/O, frame processing                       |
+| `tqdm`                  | Part B  | Progress bars                                     |
 
 ---
 

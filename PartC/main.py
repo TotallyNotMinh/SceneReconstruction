@@ -2,8 +2,6 @@ import os
 import subprocess
 import glob
 import shutil
-from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -13,8 +11,7 @@ instant_mesh_directory = os.path.join(SCRIPT_DIR, 'InstantMesh')
 source_output_dir = os.path.join(instant_mesh_directory, 'outputs')
 final_destination_dir = os.path.join(ROOT_DIR, 'Final_Outputs')
 
-
-def run_dual_gpu(directory=input_directory, project_dir=instant_mesh_directory):
+def run_single_gpu(directory=input_directory, project_dir=instant_mesh_directory):
     os.chdir(project_dir)
     valid_extensions = ('*.jpg', '*.jpeg', '*.png')
     image_files = []
@@ -28,29 +25,22 @@ def run_dual_gpu(directory=input_directory, project_dir=instant_mesh_directory):
 
     print(f"Found {len(image_files)} images in total. Starting processing...")
 
-    gpu_queue = Queue()
-    gpu_queue.put(0)
-    gpu_queue.put(1)
+    gpu_id = 0
 
-    def process_image(img_path):
-        gpu_id = gpu_queue.get()
+    for img_path in image_files:
         file_name = os.path.basename(img_path)
         print(f"-> Processing {file_name} on GPU {gpu_id}...")
 
         cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} python run.py configs/instant-mesh-base.yaml {img_path} --save_video"
         subprocess.run(cmd, shell=True)
 
-        gpu_queue.put(gpu_id)
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        executor.map(process_image, image_files)
-
     print("Completed: Processed all images!")
 
 os.makedirs(final_destination_dir, exist_ok=True)
+
 def extract_outputs():
     if not os.path.exists(source_output_dir):
-        print(f"Error: can't find {source_output_dir}. Maybe it not in here?.")
+        print(f"Error: Cannot find {source_output_dir}.")
         return
 
     for item in os.listdir(source_output_dir):
@@ -59,14 +49,14 @@ def extract_outputs():
 
         try:
             shutil.move(source_item_path, dest_item_path)
-            print(f"Đã di chuyển: {item} -> {final_destination_dir}")
+            print(f"Moved: {item} -> {final_destination_dir}")
         except Exception as e:
-            print(f"Error when transfer {item}: {e}")
+            print(f"Error moving {item}: {e}")
 
     print("Success!")
 
 if __name__ == "__main__":
-    print("Starting the Process :")
-    run_dual_gpu()
+    print("Starting the process:")
+    run_single_gpu()
     extract_outputs()
     print("Done!")
