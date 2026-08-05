@@ -1,147 +1,103 @@
-﻿# SceneReconstruction
+# Scene Reconstruction & Digital Twin Pipeline
 
-A two-part pipeline that reconstructs a furnished indoor scene from video and 3D mesh assets.
-
-```
-Part B  →  Object detection & Re-ID from video
-Part A  →  3D spatial engine: camera poses + point cloud → placed digital twin
-```
+A modular, computer vision pipeline that reconstructs a furnished 3D indoor scene from a video recording using **Depth Anything V3**, **YOLO11 + BoT-SORT + DINOv2**, **MobileSAM**, and **RANSAC 3D Spatial Assembly**.
 
 ---
 
-## Repository Structure
+## Codebase Architecture
 
 ```
 SceneReconstruction/
-├── PartA/
-│   ├── main_pipeline.py            # Part A entry point
-│   ├── synthesize_replica_data.py  # Generates Part A inputs from a Replica mesh
-│   ├── config.py                   # Voxel sizes, DBSCAN thresholds, paths
-│   ├── requirements.txt            # Part A Python dependencies
-│   ├── modules/
-│   │   ├── data_loader.py          # ARKit metadata + point cloud loader
-│   │   ├── object_estimator.py     # Back-projection, PCA, DBSCAN OBB
-│   │   ├── mesh_placer.py          # Mesh scale/align to support surface
-│   │   └── room_builder.py         # RANSAC floor/wall detection
-│   └── adapters/                   # CoordinateAdapter (ARKit → Pinhole)
+├── config.py                     # Centralized configuration & hyperparameters
+├── requirements.txt              # Unified root dependencies
 │
-├── PartB/
-│   ├── reid_pipeline.py            # Furniture detection + BoT-SORT Re-ID
-│   └── render_360_video.py         # 360° walkthrough video renderer
+├── core/                         # Core Utilities & Adapters
+│   ├── video_normalizer.py       # Resolution normalization & per-axis intrinsics scaling
+│   ├── coordinate_adapter.py     # ARKit/world/TripoSR coordinate transforms
+│   └── data_loader.py            # Point cloud, metadata & video frame I/O
 │
-├── Replica-Dataset/                # Replica scene files (download separately)
-│   ├── win_download.bat
-│   └── download.sh
+├── pointcloud/                   # Depth Anything V3 & Point Cloud Map Generator
+│   ├── depth_inference.py        # Depth Anything V3 multi-view depth & pose inference
+│   └── pointcloud_builder.py     # Global depth normalization & PLY/JSON point cloud exporter
 │
-└── .venv/                          # Python virtual environment (not committed)
+├── detection/                    # Object Detection, Tracking & Re-ID
+│   ├── reid_tracker.py           # YOLO11 + BoT-SORT + DINOv2 object tracker
+│   └── sam_segmentor.py          # MobileSAM per-object pixel segmentation wrapper
+│
+├── spatial/                      # 3D Spatial Reconstruction Engine
+│   ├── object_estimator.py       # Multi-view back-projection & 3D Alpha-Shape meshing
+│   ├── room_builder.py           # RANSAC architectural floor/table plane detector
+│   ├── mesh_placer.py            # Support surface snapping & spatial alignment
+│   └── scene_assembler.py        # Main 3D digital twin scene orchestrator
+│
+├── visualization/                # Renderers & Visualizer Utilities
+│   ├── render_side_by_side.py    # Side-by-side depth video renderer
+│   └── render_360.py             # 360-degree mesh orbit video renderer
+│
+├── weights/                      # Pretrained Model Checkpoints
+│   ├── yolo11m-seg.pt
+│   └── mobile_sam.pt
+│
+└── data/                         # Consolidated Data Directory
+    ├── raw/                      # Raw input video datasets (40753679/, 41007602/)
+    ├── processed/                # Intermediate depth maps, metadata & detections
+    └── output/                   # Reconstructed PLY point clouds & GLB digital twin scenes
 ```
 
 ---
 
 ## Quick Start
 
-### 1 — Clone & create virtual environment
+### 1. Environment Setup
 
 ```powershell
-git clone <repo-url>
-cd SceneReconstruction
+# Activate virtual environment
+.venv\Scripts\activate
 
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux / macOS
+# Install dependencies from root requirements.txt
+pip install -r requirements.txt
 ```
 
-### 2 — Install dependencies
+### 2. Step 1 — Generate 3D Point Cloud Map (Depth Anything V3)
 
 ```powershell
-# Part A (3D spatial engine)
-pip install -r PartA/requirements.txt
-
-# Part B (video Re-ID pipeline)
-pip install ultralytics torch torchvision opencv-python tqdm Pillow
+python pointcloud/depth_inference.py data/raw/40753679/40753679.mov
 ```
 
-### 3 — Download a Replica scene
+Outputs:
+- `data/output/world_pointcloud.ply`
+- `data/processed/ar_metadata.json`
+- `data/processed/depth_maps.npz`
+
+### 3. Step 2 — Track Objects & Re-ID (YOLO11 + BoT-SORT + DINOv2)
 
 ```powershell
-# Windows
-Replica-Dataset\win_download.bat
-
-# Linux / macOS
-bash Replica-Dataset/download.sh /path/to/output
+python detection/reid_tracker.py data/raw/40753679/40753679.mov
 ```
 
-### 4 — Synthesise Part A inputs from the Replica mesh
+Outputs:
+- `data/processed/detections.json`
+- `data/processed/reid_output/`
+
+### 4. Step 3 — Reconstruct & Assemble 3D Digital Twin Scene
 
 ```powershell
-# Auto-discovers the first mesh.ply under Replica-Dataset/
-python PartA/synthesize_replica_data.py
-
-# Or point to a specific scene
-python PartA/synthesize_replica_data.py Replica-Dataset\room_0\mesh.ply
+python spatial/scene_assembler.py --video=data/raw/40753679/40753679.mov
 ```
 
-This produces everything Part A needs inside `PartA/data/`:
-
-| File | Description |
-|---|---|
-| `ar_metadata.json` | 120 synthetic ARKit camera poses (360° orbit) |
-| `world_pointcloud.ply` | 80 k-point surface sample, voxel-cleaned |
-| `room_layout.obj` | Floor slab geometry for RANSAC detection |
-| `detections_from_b.json` | Per-object 2D bounding boxes per frame |
-| `meshes_from_c/*.obj` | Axis-aligned proxy mesh per furniture cluster |
-
-### 5 — Run Part A (3D spatial engine)
-
-```powershell
-python PartA/main_pipeline.py
-```
-
-Output: `PartA/data/output/digital_twin_scene.glb`
-
-### 6 — Run Part B (video Re-ID pipeline)
-
-Place your input video at `PartB/demo.mp4`, then:
-
-```powershell
-python PartB/reid_pipeline.py
-```
-
-Outputs land in `PartB/reid_objects_output/`:
-
-| Path | Description |
-|---|---|
-| `reid_objects_output/demo_tracked.mp4` | Annotated tracking video |
-| `reid_objects_output/segmented/` | Per-object segmentation crops |
-| `reid_objects_output/bbox_unclipped/` | Full-frame annotated stills |
-
-### 7 — (Optional) Render 360° video from Replica
-
-```powershell
-python PartB/render_360_video.py
-```
+Outputs:
+- `data/output/digital_twin_scene.glb`
 
 ---
 
-## Dependencies at a Glance
+## Visualization Tools
 
-| Package | Used by | Purpose |
-|---|---|---|
-| `open3d` | Part A | Point cloud I/O, voxel sampling, outlier removal |
-| `trimesh` | Part A | Mesh loading, surface sampling, proxy mesh export |
-| `scikit-learn` | Part A | DBSCAN clustering, PCA OBB |
-| `scipy` | Part A | Spatial transforms |
-| `pydantic` | Part A | Config validation |
-| `ultralytics` | Part B | YOLO11m-seg detection |
-| `torch` + `torchvision` | Part B | Re-ID feature embeddings |
-| `opencv-python` | Part B | Video I/O, frame processing |
-| `tqdm` | Part B | Progress bars |
+Render side-by-side RGB vs Depth video:
+```powershell
+python visualization/render_side_by_side.py data/raw/40753679/40753679.mov
+```
 
----
-
-## Notes
-
-- **Model weights** (`*.pt`, `*.pth`) are excluded from git — download via Ultralytics on first run.
-- **Replica-Dataset scene files** are excluded — they are multi-GB downloads.
-- **Generated data** (`PartA/data/`, `reid_objects_output/`) is excluded — regenerate with the steps above.
-- The synthesizer uses a pure-geometry heuristic (Y-band floor detection + XZ DBSCAN). For better furniture isolation, provide your own `detections_from_b.json` from a real Part B run.
+Render 360° orbit video of reconstructed 3D mesh:
+```powershell
+python visualization/render_360.py data/output/digital_twin_scene.glb
+```
