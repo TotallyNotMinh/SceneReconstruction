@@ -46,7 +46,7 @@ def load_depth_anything_model(device=None):
 
     model_id = "depth-anything/da3-base"
     print(f"[+] Loading Depth Anything V3 Base model ({model_id}) on {device}...")
-    model = DepthAnything3.from_pretrained(model_id).to(device)
+    model = DepthAnything3.from_pretrained(model_id).half().to(device)
     model.eval()
     return model, device
 
@@ -54,7 +54,7 @@ def load_depth_anything_model(device=None):
 def run_depth_inference(
     video_path: Path,
     sample_stride: int = 8,
-    max_frames: int = 60,
+    max_frames: int = 30,
     npz_out: Path | None = None,
 ) -> Path:
     video_path = Path(video_path)
@@ -116,15 +116,42 @@ def run_depth_inference(
     if not pil_images:
         sys.exit("[ERROR] Failed to extract any valid frames from video.")
 
-    print(f"[+] Pass 1 — running Depth Anything V3 joint multi-view inference on {len(pil_images)} frames...")
-    with torch.no_grad():
-        result = model.inference(pil_images)
+    chunk_size = 8
+    raw_depths = []
+    raw_exts_acc = []
+    raw_ixts_acc = []
+    raw_confs_acc = []
+    proc_imgs_acc = []
+    n_chunks = math.ceil(len(pil_images) / chunk_size)
 
-    raw_depths = result.depth
-    raw_exts   = result.extrinsics
-    raw_ixts   = result.intrinsics
-    raw_confs  = getattr(result, "conf", None)
-    proc_imgs  = getattr(result, "processed_images", None)
+    for ci in range(0, len(pil_images), chunk_size):
+        chunk = pil_images[ci:ci + chunk_size]
+        print(f"[+] Pass 1 — chunk {ci // chunk_size + 1}/{n_chunks} ({len(chunk)} frames)...")
+        with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+            result = model.inference(chunk)
+
+        raw_depths.extend(result.depth)
+
+        if result.extrinsics is not None:
+            raw_exts_acc.extend(result.extrinsics)
+        if result.intrinsics is not None:
+            raw_ixts_acc.extend(result.intrinsics)
+
+        chunk_confs = getattr(result, "conf", None)
+        if chunk_confs is not None:
+            raw_confs_acc.extend(chunk_confs)
+
+        chunk_proc = getattr(result, "processed_images", None)
+        if chunk_proc is not None:
+            proc_imgs_acc.extend(chunk_proc)
+
+        del result
+        torch.cuda.empty_cache()
+
+    raw_exts  = raw_exts_acc if raw_exts_acc else None
+    raw_ixts  = raw_ixts_acc if raw_ixts_acc else None
+    raw_confs = raw_confs_acc if raw_confs_acc else None
+    proc_imgs = proc_imgs_acc if proc_imgs_acc else None
 
     frames_meta_raw = []
     for idx, i in enumerate(valid_indices):
