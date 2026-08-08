@@ -174,6 +174,7 @@ def normalize_and_preprocess_video(
     target_long_edge: int = 720,
     target_fps: int = 24,
     is_prepackaged_dataset: bool = False,
+    output_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Executes the full Video Resolution Normalization & Intrinsics Scaling Pipeline.
@@ -234,10 +235,14 @@ def normalize_and_preprocess_video(
 
     # Step 2 & 6: Execute FFmpeg resizing + orientation normalization
     suffix = video_path.suffix or ".mp4"
-    import config as _cfg
-    out_dir = _cfg.PROCESSED_DATA_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_dir / f"{video_path.stem}_normalized{suffix}"
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = output_dir / f"{video_path.stem}_normalized{suffix}"
+    else:
+        tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=suffix)
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_path_str)
 
     print(f"[Video Normalizer] Processing: '{video_path.name}'")
     print(f"                   Raw: {meta['raw_width']}x{meta['raw_height']} (rotation={rotation}°)")
