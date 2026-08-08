@@ -1,5 +1,7 @@
 # Scene Reconstruction & Digital Twin Pipeline Dependencies
-numpy>=1.24.0
+# numpy is pinned below 2.0 — packages compiled against numpy 1.x (torchvision,
+# open3d, sklearn, etc.) raise ABI errors if numpy is upgraded to 2.x.
+numpy>=1.24.0,<2.0
 # opencv-python-headless works on both desktop and headless (Kaggle/server) environments.
 # Do NOT install both opencv-python and opencv-python-headless — they conflict.
 opencv-python-headless>=4.8.0
@@ -13,7 +15,9 @@ ultralytics>=8.0.0
 transformers>=4.30.0
 pillow>=10.0.0
 tqdm>=4.65.0
-mobile-sam
+# mobile-sam PyPI package only supports Python <=3.11; install from git source instead.
+# Kaggle (Python 3.12) and other modern environments must use the git version.
+mobile-sam @ git+https://github.com/ChaoningZhang/MobileSAM.git
 # depth-anything-3 has no PyPI release — install from source:
 # git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git && pip install -e .
 # OR: pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git
