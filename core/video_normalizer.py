@@ -234,7 +234,8 @@ def normalize_and_preprocess_video(
 
     # Step 2 & 6: Execute FFmpeg resizing + orientation normalization
     suffix = video_path.suffix or ".mp4"
-    out_dir = Path(os.environ.get("PROCESSED_DATA_DIR", str(video_path.parent)))
+    import config as _cfg
+    out_dir = _cfg.PROCESSED_DATA_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = out_dir / f"{video_path.stem}_normalized{suffix}"
 
