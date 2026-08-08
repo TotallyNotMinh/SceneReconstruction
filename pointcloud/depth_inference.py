@@ -46,7 +46,7 @@ def load_depth_anything_model(device=None):
 
     model_id = "depth-anything/da3-base"
     print(f"[+] Loading Depth Anything V3 Base model ({model_id}) on {device}...")
-    model = DepthAnything3.from_pretrained(model_id).half().to(device)
+    model = DepthAnything3.from_pretrained(model_id).to(device)
     model.eval()
     return model, device
 
@@ -117,41 +117,96 @@ def run_depth_inference(
         sys.exit("[ERROR] Failed to extract any valid frames from video.")
 
     chunk_size = 8
-    raw_depths = []
-    raw_exts_acc = []
-    raw_ixts_acc = []
-    raw_confs_acc = []
-    proc_imgs_acc = []
-    n_chunks = math.ceil(len(pil_images) / chunk_size)
+    overlap = 2
+    stride = chunk_size - overlap
 
-    for ci in range(0, len(pil_images), chunk_size):
-        chunk = pil_images[ci:ci + chunk_size]
-        print(f"[+] Pass 1 — chunk {ci // chunk_size + 1}/{n_chunks} ({len(chunk)} frames)...")
+    chunk_ranges = []
+    cs = 0
+    while cs < len(pil_images):
+        ce = min(cs + chunk_size, len(pil_images))
+        chunk_ranges.append((cs, ce))
+        if ce >= len(pil_images):
+            break
+        cs += stride
+
+    n_chunks = len(chunk_ranges)
+    chunk_data = []
+
+    for ci, (cs, ce) in enumerate(chunk_ranges):
+        chunk = pil_images[cs:ce]
+        print(f"[+] Pass 1 — chunk {ci + 1}/{n_chunks} ({len(chunk)} frames)...")
         with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
             result = model.inference(chunk)
 
-        raw_depths.extend(result.depth)
+        _exts = result.extrinsics
+        _ixts = result.intrinsics
+        _confs = getattr(result, 'conf', None)
+        _proc = getattr(result, 'processed_images', None)
 
-        if result.extrinsics is not None:
-            raw_exts_acc.extend(result.extrinsics)
-        if result.intrinsics is not None:
-            raw_ixts_acc.extend(result.intrinsics)
-
-        chunk_confs = getattr(result, "conf", None)
-        if chunk_confs is not None:
-            raw_confs_acc.extend(chunk_confs)
-
-        chunk_proc = getattr(result, "processed_images", None)
-        if chunk_proc is not None:
-            proc_imgs_acc.extend(chunk_proc)
-
+        cd = {
+            'start': cs,
+            'end': ce,
+            'depths': list(result.depth),
+            'exts': [np.array(e) for e in _exts] if _exts is not None else None,
+            'ixts': [np.array(e) for e in _ixts] if _ixts is not None else None,
+            'confs': [np.array(e) for e in _confs] if _confs is not None else None,
+            'proc_imgs': [np.array(e) for e in _proc] if _proc is not None else None,
+        }
+        chunk_data.append(cd)
         del result
         torch.cuda.empty_cache()
 
-    raw_exts  = raw_exts_acc if raw_exts_acc else None
-    raw_ixts  = raw_ixts_acc if raw_ixts_acc else None
-    raw_confs = raw_confs_acc if raw_confs_acc else None
-    proc_imgs = proc_imgs_acc if proc_imgs_acc else None
+    def _ext_to_4x4(e):
+        e = np.array(e, dtype=np.float64)
+        if e.shape == (3, 4):
+            m = np.eye(4, dtype=np.float64)
+            m[:3, :4] = e
+            return m
+        return e
+
+    has_all_exts = all(cd['exts'] is not None for cd in chunk_data)
+    if has_all_exts and len(chunk_data) > 1:
+        corrections = [np.eye(4, dtype=np.float64)]
+        for i in range(1, len(chunk_data)):
+            prev_cd = chunk_data[i - 1]
+            curr_cd = chunk_data[i]
+
+            overlap_idx_in_prev = curr_cd['start'] - prev_cd['start']
+            ext_prev = _ext_to_4x4(prev_cd['exts'][overlap_idx_in_prev])
+            ext_curr = _ext_to_4x4(curr_cd['exts'][0])
+
+            ext_prev_aligned = ext_prev @ corrections[i - 1]
+            correction = np.linalg.inv(ext_curr) @ ext_prev_aligned
+            corrections.append(correction)
+
+        for i, cd in enumerate(chunk_data):
+            if cd['exts'] is not None:
+                for j in range(len(cd['exts'])):
+                    cd['exts'][j] = _ext_to_4x4(cd['exts'][j]) @ corrections[i]
+
+    raw_depths = list(chunk_data[0]['depths'])
+    raw_exts_acc = list(chunk_data[0]['exts']) if chunk_data[0]['exts'] is not None else []
+    raw_ixts_acc = list(chunk_data[0]['ixts']) if chunk_data[0]['ixts'] is not None else []
+    raw_confs_acc = list(chunk_data[0]['confs']) if chunk_data[0]['confs'] is not None else []
+    proc_imgs_acc = list(chunk_data[0]['proc_imgs']) if chunk_data[0]['proc_imgs'] is not None else []
+
+    for i in range(1, len(chunk_data)):
+        cd = chunk_data[i]
+        skip = chunk_data[i - 1]['end'] - cd['start']
+        raw_depths.extend(cd['depths'][skip:])
+        if cd['exts'] is not None:
+            raw_exts_acc.extend(cd['exts'][skip:])
+        if cd['ixts'] is not None:
+            raw_ixts_acc.extend(cd['ixts'][skip:])
+        if cd['confs'] is not None:
+            raw_confs_acc.extend(cd['confs'][skip:])
+        if cd['proc_imgs'] is not None:
+            proc_imgs_acc.extend(cd['proc_imgs'][skip:])
+
+    raw_exts  = raw_exts_acc if len(raw_exts_acc) > 0 else None
+    raw_ixts  = raw_ixts_acc if len(raw_ixts_acc) > 0 else None
+    raw_confs = raw_confs_acc if len(raw_confs_acc) > 0 else None
+    proc_imgs = proc_imgs_acc if len(proc_imgs_acc) > 0 else None
 
     frames_meta_raw = []
     for idx, i in enumerate(valid_indices):
@@ -173,10 +228,7 @@ def run_depth_inference(
         })
 
     if preprocessed_path is not None and preprocessed_path.exists():
-        try:
-            preprocessed_path.unlink()
-        except OSError:
-            pass
+        print(f"[+] Normalized video kept at: {preprocessed_path}")
 
     print(f"[+] Pass 1 done — {len(raw_depths)} frames processed.")
 

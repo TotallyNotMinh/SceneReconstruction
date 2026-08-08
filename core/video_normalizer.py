@@ -234,9 +234,9 @@ def normalize_and_preprocess_video(
 
     # Step 2 & 6: Execute FFmpeg resizing + orientation normalization
     suffix = video_path.suffix or ".mp4"
-    tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=suffix)
-    os.close(tmp_fd)
-    tmp_path = Path(tmp_path_str)
+    out_dir = Path(os.environ.get("PROCESSED_DATA_DIR", str(video_path.parent)))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_dir / f"{video_path.stem}_normalized{suffix}"
 
     print(f"[Video Normalizer] Processing: '{video_path.name}'")
     print(f"                   Raw: {meta['raw_width']}x{meta['raw_height']} (rotation={rotation}°)")
