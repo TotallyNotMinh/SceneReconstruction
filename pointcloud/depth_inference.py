@@ -57,7 +57,7 @@ def load_depth_anything_model(device=None):
 def run_depth_inference(
     video_path: Path,
     sample_stride: int = 8,
-    max_frames: int = 15,
+    max_frames: int = 10,
     npz_out: Path | None = None,
 ) -> Path:
     video_path = Path(video_path)
@@ -120,7 +120,11 @@ def run_depth_inference(
         sys.exit("[ERROR] Failed to extract any valid frames from video.")
 
     print(f"[+] Pass 1 — running Depth Anything V3 joint multi-view inference on {len(pil_images)} frames...")
-    with torch.no_grad():
+    if torch.cuda.is_available():
+        free_mem = torch.cuda.mem_get_info()[0] / (1024**3)
+        total_mem = torch.cuda.mem_get_info()[1] / (1024**3)
+        print(f"    GPU memory: {free_mem:.1f} GiB free / {total_mem:.1f} GiB total")
+    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
         result = model.inference(pil_images)
 
     raw_depths = result.depth
@@ -207,7 +211,7 @@ def run_depth_inference(
 def generate_pcd_from_video(
     video_path: Path,
     sample_stride: int = 8,
-    max_frames: int = 15,
+    max_frames: int = 10,
     point_step: int = 4,
     return_depth_maps: bool = False,
 ):
