@@ -215,7 +215,7 @@ def run_depth_inference(
             e = raw_exts[idx]
             ext_mat[:e.shape[0], :e.shape[1]] = e
 
-        video_frame_id = sampled_indices[idx]
+        video_frame_id = sampled_indices[i]
         frame_fps = fps if (fps is not None and fps > 0) else 30.0
         ts_ns = int(video_frame_id * (1e9 / frame_fps))
 
@@ -286,7 +286,7 @@ def run_depth_inference(
 def generate_pcd_from_video(
     video_path: Path,
     sample_stride: int = 8,
-    max_frames: int = 60,
+    max_frames: int = 30,
     point_step: int = 4,
     return_depth_maps: bool = False,
 ):
