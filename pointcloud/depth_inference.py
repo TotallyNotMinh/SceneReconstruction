@@ -36,6 +36,7 @@ except ImportError as _e:
     )
 
 DEFAULT_NPZ_PATH = config.PROCESSED_DATA_DIR / "raw_depths.npz"
+RAW_META_PATH    = config.PROCESSED_DATA_DIR / "ar_metadata.json"
 
 
 def preprocess_video(
@@ -65,6 +66,7 @@ def run_depth_inference(
     sample_stride: int = config.DEPTH_SAMPLE_STRIDE,
     max_frames: int = config.DEPTH_MAX_FRAMES,
     npz_out: Path | None = None,
+    use_fp16: bool = config.DEPTH_USE_FP16,
 ) -> Path:
     video_path = Path(video_path)
     if not video_path.exists():
@@ -84,7 +86,10 @@ def run_depth_inference(
 
     model, device = load_depth_anything_model()
 
-    cap          = cv2.VideoCapture(str(working_path))
+    cap = cv2.VideoCapture(str(working_path))
+    if not cap.isOpened():
+        sys.exit(f"[ERROR] Cannot open processed video: {working_path}")
+
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -125,9 +130,14 @@ def run_depth_inference(
     if not pil_images:
         sys.exit("[ERROR] Failed to extract any valid frames from video.")
 
-    print(f"[+] Pass 1 — running Depth Anything V3 joint multi-view inference on {len(pil_images)} frames...")
+    fp16_str = " [FP16 autocast enabled]" if (use_fp16 and device == "cuda") else " [FP32]"
+    print(f"[+] Pass 1 — running Depth Anything V3 joint multi-view inference on {len(pil_images)} frames{fp16_str}...")
     with torch.no_grad():
-        result = model.inference(pil_images)
+        if use_fp16 and device == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                result = model.inference(pil_images)
+        else:
+            result = model.inference(pil_images)
 
     raw_depths = result.depth
     raw_exts   = result.extrinsics
@@ -143,16 +153,47 @@ def run_depth_inference(
             ext_mat[:e.shape[0], :e.shape[1]] = e
 
         video_frame_id = sampled_indices[idx]
-        frame_fps = fps if (fps is not None and fps > 0) else 30.0
-        ts_ns = int(video_frame_id * (1e9 / frame_fps))
+        frame_dict = {
+            "index": int(i),
+            "video_frame_index": int(video_frame_id),
+            "pose_matrix": ext_mat.tolist(),
+        }
+        if raw_ixts is not None:
+            ixt = raw_ixts[idx]
+            frame_dict["fl_x"] = float(ixt[0, 0])
+            frame_dict["fl_y"] = float(ixt[1, 1])
+            frame_dict["cx"]   = float(ixt[0, 2])
+            frame_dict["cy"]   = float(ixt[1, 2])
+            frame_dict["w"]    = int(w)
+            frame_dict["h"]    = int(h)
+        frames_meta_raw.append(frame_dict)
 
-        frames_meta_raw.append({
-            "frame_id":       i,
-            "video_frame_id": video_frame_id,
-            "timestamp_ns":   ts_ns,
-            "tracking_state": "TRACKING",
-            "pose_matrix":    ext_mat.tolist(),
-        })
+    if prep_meta:
+        meta_payload = {
+            "w": w,
+            "h": h,
+            "scale_x": scale_x,
+            "scale_y": scale_y,
+            "orig_intrinsics": orig_intrinsics,
+            "processed_intrinsics": rescaled_intrinsics,
+            "frames": frames_meta_raw,
+        }
+    else:
+        meta_payload = {
+            "w": w,
+            "h": h,
+            "fl_x": float(intrinsics[0]),
+            "fl_y": float(intrinsics[1]),
+            "cx": float(intrinsics[2]),
+            "cy": float(intrinsics[3]),
+            "frames": frames_meta_raw,
+        }
+
+    raw_meta_path = RAW_META_PATH
+    raw_meta_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(raw_meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta_payload, f, indent=2)
+    print(f"[+] Saved AR metadata ({len(frames_meta_raw)} frames) -> {raw_meta_path}")
 
     if preprocessed_path is not None and preprocessed_path.exists():
         try:
@@ -176,20 +217,23 @@ def run_depth_inference(
         "frames_meta":     np.bytes_(json.dumps(frames_meta_raw, separators=(",", ":"))
                                      .encode("utf-8")),
     }
-    for i in range(len(raw_depths)):
-        d_arr = raw_depths[i].astype(np.float32)
-        dh, dw = d_arr.shape[:2]
-        sx, sy = w / float(dw), h / float(dh)
-
-        if (dh, dw) != (h, w):
+    for idx, i in enumerate(valid_indices):
+        d_arr = raw_depths[idx].astype(np.float32)
+        if d_arr.shape[:2] != (h, w):
             d_arr = cv2.resize(d_arr, (w, h), interpolation=cv2.INTER_NEAREST)
         arrays[f"depth_{i}"] = d_arr
 
         if raw_exts is not None:
-            arrays[f"ext_{i}"] = raw_exts[i].astype(np.float32)
+            arrays[f"ext_{i}"] = raw_exts[idx].astype(np.float32)
 
         if raw_ixts is not None:
-            ixt_arr = raw_ixts[i].astype(np.float32).copy()
+            ixt_arr = raw_ixts[idx].astype(np.float32)
+            if proc_imgs is not None:
+                orig_h, orig_w = proc_imgs[idx].shape[:2]
+            else:
+                orig_h, orig_w = h, w
+            sx = w / orig_w
+            sy = h / orig_h
             ixt_arr[0, 0] *= sx
             ixt_arr[1, 1] *= sy
             ixt_arr[0, 2] *= sx
@@ -197,18 +241,18 @@ def run_depth_inference(
             arrays[f"ixt_{i}"] = ixt_arr
 
         if raw_confs is not None:
-            c_arr = raw_confs[i].astype(np.float32)
+            c_arr = raw_confs[idx].astype(np.float32)
             if c_arr.shape[:2] != (h, w):
                 c_arr = cv2.resize(c_arr, (w, h), interpolation=cv2.INTER_NEAREST)
             arrays[f"conf_{i}"] = c_arr
 
-        rgb_img = proc_imgs[i] if proc_imgs is not None else rgb_frames[i]
+        rgb_img = proc_imgs[idx] if proc_imgs is not None else rgb_frames[idx]
         if rgb_img.shape[:2] != (h, w):
             rgb_img = cv2.resize(rgb_img, (w, h), interpolation=cv2.INTER_LINEAR)
         arrays[f"rgb_{i}"] = rgb_img
 
     np.savez_compressed(str(npz_out), **arrays)
-    print(f"[+] Raw depths + predicted camera poses saved ({len(raw_depths)} frames) → {npz_out}")
+    print(f"[+] Raw depths + predicted camera poses saved ({len(raw_depths)} frames) -> {npz_out}")
 
     return npz_out
 
@@ -219,11 +263,13 @@ def generate_pcd_from_video(
     max_frames: int = 60,
     point_step: int = 4,
     return_depth_maps: bool = False,
+    use_fp16: bool = config.DEPTH_USE_FP16,
 ):
     npz_path = run_depth_inference(
         video_path,
         sample_stride=sample_stride,
         max_frames=max_frames,
+        use_fp16=use_fp16,
     )
 
     from pointcloud.pointcloud_builder import build_pointcloud_from_npz
@@ -235,11 +281,13 @@ def generate_pcd_from_video(
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        sys.exit(
-            "[ERROR] Please specify an input video file.\n"
-            "Usage: python pointcloud/depth_inference.py <video_file> [raw_depths.npz]"
-        )
-    _video   = sys.argv[1]
-    _npz_out = Path(sys.argv[2]) if len(sys.argv) >= 3 else None
-    run_depth_inference(_video, npz_out=_npz_out)
+    import argparse
+    parser = argparse.ArgumentParser(description="Depth Anything V3 Multi-View Inference")
+    parser.add_argument("video", type=str, help="Path to input video file")
+    parser.add_argument("npz_out", type=str, nargs="?", default=None, help="Path to output NPZ file (optional)")
+    parser.add_argument("--fp16", action="store_true", default=config.DEPTH_USE_FP16, help="Run inference in FP16 mixed precision")
+    args = parser.parse_args()
+
+    _video = args.video
+    _npz_out = Path(args.npz_out) if args.npz_out else None
+    run_depth_inference(_video, npz_out=_npz_out, use_fp16=args.fp16)

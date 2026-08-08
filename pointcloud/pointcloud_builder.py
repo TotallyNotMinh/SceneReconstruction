@@ -66,13 +66,6 @@ def build_pointcloud_from_npz(
     print(f"[+] Pass 2 — loading raw depths from '{npz_path.name}'...")
     npz = np.load(str(npz_path), allow_pickle=False)
 
-    w          = int(npz["video_w"])
-    h          = int(npz["video_h"])
-    intrinsics = npz["intrinsics"].tolist()
-    fx, fy, cx, cy = intrinsics
-
-    frames_meta: list = json.loads(npz["frames_meta"].tobytes().decode("utf-8"))
-
     depth_keys = sorted(
         (k for k in npz.files if k.startswith("depth_")),
         key=lambda k: int(k.split("_", 1)[1]),
@@ -82,6 +75,26 @@ def build_pointcloud_from_npz(
 
     n_frames = len(depth_keys)
     raw_depths = [npz[f"depth_{i}"] for i in range(n_frames)]
+
+    # Safe metadata extraction with fallback to raw frame shapes
+    if "video_w" in npz and "video_h" in npz:
+        w = int(npz["video_w"])
+        h = int(npz["video_h"])
+    else:
+        h, w = raw_depths[0].shape[:2]
+
+    if "intrinsics" in npz:
+        intrinsics = npz["intrinsics"].tolist()
+        fx, fy, cx, cy = intrinsics
+    else:
+        fx = fy = 1.2 * max(w, h)
+        cx, cy = w / 2.0, h / 2.0
+        intrinsics = [float(fx), float(fy), float(cx), float(cy)]
+
+    if "frames_meta" in npz:
+        frames_meta: list = json.loads(npz["frames_meta"].tobytes().decode("utf-8"))
+    else:
+        frames_meta = []
     ext_keys   = [f"ext_{i}" for i in range(n_frames) if f"ext_{i}" in npz]
     ixt_keys   = [f"ixt_{i}" for i in range(n_frames) if f"ixt_{i}" in npz]
     rgb_keys   = [f"rgb_{i}" for i in range(n_frames) if f"rgb_{i}" in npz]
@@ -112,9 +125,6 @@ def build_pointcloud_from_npz(
         depth_map = raw_depths[i].astype(np.float64)
         depth_maps_out[i] = depth_map
 
-        if i < len(frames_meta):
-            frames_metadata_out.append(frames_meta[i])
-
         H, W = depth_map.shape
 
         if has_predicted_poses and i < len(ixt_keys):
@@ -132,6 +142,21 @@ def build_pointcloud_from_npz(
         else:
             pose = np.array(frames_meta[i]["pose_matrix"]) if i < len(frames_meta) else np.eye(4)
             c2w = pose
+
+        if i < len(frames_meta):
+            frames_metadata_out.append(frames_meta[i])
+        else:
+            f_dict = {
+                "index": int(i),
+                "pose_matrix": c2w.tolist(),
+                "fl_x": float(K_i[0, 0]),
+                "fl_y": float(K_i[1, 1]),
+                "cx": float(K_i[0, 2]),
+                "cy": float(K_i[1, 2]),
+                "w": int(W),
+                "h": int(H),
+            }
+            frames_metadata_out.append(f_dict)
 
         us = np.arange(0, W, point_step)
         vs = np.arange(0, H, point_step)
@@ -215,7 +240,7 @@ def build_pointcloud_from_npz(
     for ply_path in (config.PROCESSED_DATA_DIR / "world_pointcloud.ply",
                      config.OUTPUT_DIR / "world_pointcloud.ply"):
         cloud.export(str(ply_path))
-    print(f"[+] OK Point cloud saved ({len(pts_clean):,} pts) → {config.OUTPUT_DIR / 'world_pointcloud.ply'}")
+    print(f"[+] OK Point cloud saved ({len(pts_clean):,} pts) -> {config.OUTPUT_DIR / 'world_pointcloud.ply'}")
 
     orig_intrinsics = npz["orig_intrinsics"].tolist() if "orig_intrinsics" in npz else intrinsics
     scale_x = float(npz["scale_x"]) if "scale_x" in npz else 1.0
@@ -233,7 +258,7 @@ def build_pointcloud_from_npz(
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
     print(f"[+] OK Camera metadata saved ({len(frames_metadata_out)} frames) "
-          f"→ {config.PROCESSED_DATA_DIR / 'ar_metadata.json'}")
+          f"-> {config.PROCESSED_DATA_DIR / 'ar_metadata.json'}")
 
     if return_depth_maps:
         return pts_clean, metadata, depth_maps_out
@@ -241,6 +266,12 @@ def build_pointcloud_from_npz(
 
 
 if __name__ == "__main__":
-    _npz   = Path(sys.argv[1]) if len(sys.argv) >= 2 else DEFAULT_NPZ_PATH
-    _step  = int(sys.argv[2])  if len(sys.argv) >= 3 else 4
-    build_pointcloud_from_npz(_npz, point_step=_step)
+    import argparse
+    parser = argparse.ArgumentParser(description="Stage 1 Pass 2: 3D Point Cloud Construction")
+    parser.add_argument("npz", type=str, nargs="?", default=str(DEFAULT_NPZ_PATH), help="Path to raw_depths.npz file")
+    parser.add_argument("--step", "--point-step", type=int, default=4, dest="step", help="Pixel stride per frame (default: 4, 1 = full resolution)")
+    parser.add_argument("--voxel-size", type=float, default=config.VOXEL_SIZE_PCD, help="Voxel downsampling size in meters (default: 0.02)")
+    args = parser.parse_args()
+
+    _npz = Path(args.npz)
+    build_pointcloud_from_npz(_npz, point_step=args.step, voxel_size=args.voxel_size)

@@ -247,13 +247,17 @@ print("Depth Anything V3 installed successfully")
 Run Depth Anything V3 joint multi-view inference on your raw input video:
 
 ```bash
+# Standard FP32 inference (recommended for Ampere/Ada RTX 30/40 GPUs):
 python pointcloud/depth_inference.py data/raw/<dataset_id>/<dataset_id>.mov
+
+# FP16 mixed precision (required for Turing/Tesla T4 on Kaggle to avoid OOM):
+python pointcloud/depth_inference.py data/raw/<dataset_id>/<dataset_id>.mov --fp16
 ```
 
 Optionally specify a custom output path for the raw depths archive:
 
 ```bash
-python pointcloud/depth_inference.py data/raw/<dataset_id>/<dataset_id>.mov data/processed/raw_depths.npz
+python pointcloud/depth_inference.py data/raw/<dataset_id>/<dataset_id>.mov data/processed/raw_depths.npz --fp16
 ```
 
 #### Internal Processing Steps:
@@ -272,13 +276,14 @@ python pointcloud/depth_inference.py data/raw/<dataset_id>/<dataset_id>.mov data
 Back-project the saved depth maps into a global 3D point cloud:
 
 ```bash
+# Default (step=4, voxel_size=0.02m):
 python pointcloud/pointcloud_builder.py data/processed/raw_depths.npz
-```
 
-Optionally control point density via `point_step` (samples every Nth pixel per axis; lower = denser cloud, higher VRAM/memory usage):
+# Denser point cloud (step=2, samples 4x more pixels):
+python pointcloud/pointcloud_builder.py data/processed/raw_depths.npz --step 2
 
-```bash
-python pointcloud/pointcloud_builder.py data/processed/raw_depths.npz <point_step>
+# Maximum resolution (step=1, voxel_size=1cm for ultra-dense point cloud):
+python pointcloud/pointcloud_builder.py data/processed/raw_depths.npz --step 1 --voxel-size 0.01
 ```
 
 #### Internal Processing Steps:
@@ -371,6 +376,7 @@ Pipeline parameters can be customized in [`config.py`](config.py):
 | `DEPTH_MODEL_ID` | `depth-anything/da3-base` | HuggingFace model repo ID for Depth Anything V3 |
 | `DEPTH_SAMPLE_STRIDE` | `8` | Sample 1 frame every N frames for DA3 joint inference |
 | `DEPTH_MAX_FRAMES` | `60` | Max frames fed simultaneously to DA3 (bounded by GPU VRAM) |
+| `DEPTH_USE_FP16` | `False` | Run DA3 in FP16 mixed precision (use `--fp16` on Turing/T4 GPUs) |
 | `DEPTH_METRIC_MIN / MAX` | `0.5m / 5.0m` | Metric depth clipping range for global depth normalization |
 | `VOXEL_SIZE_PCD` | `0.02m` | Voxel grid downsampling cell size for point cloud deduplication |
 | `TARGET_CLASSES` | `chair, couch, tv, microwave, oven, refrigerator, dining table` | COCO object classes to detect and reconstruct |

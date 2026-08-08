@@ -195,10 +195,9 @@ try:
     print(f"  VIDEO_TARGET_LONG_EDGE : {config.VIDEO_TARGET_LONG_EDGE}px")
     print(f"  VIDEO_TARGET_FPS       : {config.VIDEO_TARGET_FPS} FPS")
     print(f"  DEPTH_MODEL_ID         : {config.DEPTH_MODEL_ID}")
-    print(f"  DEPTH_SAMPLE_STRIDE    : every {config.DEPTH_SAMPLE_STRIDE} frames")
-    print(f"  DEPTH_MAX_FRAMES       : {config.DEPTH_MAX_FRAMES} frames max")
+    print(f"  DEPTH_USE_FP16         : {config.DEPTH_USE_FP16}")
     print(f"\n  [✓] Config OK — pipeline is ready to run.")
-    print(f"\n  Pass 1: python {REPO_DIR}/pointcloud/depth_inference.py <video.mov>")
-    print(f"  Pass 2: python {REPO_DIR}/pointcloud/pointcloud_builder.py")
+    print(f"\n  Pass 1 (depth): python {REPO_DIR}/pointcloud/depth_inference.py <video.mov> --fp16")
+    print(f"  Pass 2 (pcd):   python {REPO_DIR}/pointcloud/pointcloud_builder.py")
 except Exception as e:
     print(f"  [✗] Config error: {e}")
