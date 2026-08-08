@@ -138,6 +138,37 @@ data/
 
 Follow these step-by-step instructions to run a complete pass from raw video to a 3D digital twin.
 
+---
+
+### Running on Kaggle / Cloud Notebooks
+
+> **Requirements**: Internet **ON** (Settings → Internet → On) + GPU accelerator enabled.
+
+Run the bundled setup script as a notebook cell — it installs all dependencies, clones Depth Anything V3, verifies all imports, and prints a smoke test:
+
+```python
+exec(open("/kaggle/working/SceneReconstruction/scripts/kaggle_setup.py").read())
+```
+
+Or as a shell cell:
+```bash
+python /kaggle/working/SceneReconstruction/scripts/kaggle_setup.py
+```
+
+#### Kaggle Compatibility Notes
+
+| Component | Status | Notes |
+| :--- | :--- | :--- |
+| `opencv-python-headless` | ✅ Ready | Used instead of `opencv-python` — no display libs needed |
+| `open3d` | ✅ Ready | Requires `libgl1-mesa-glx` (installed by setup script) |
+| `ffmpeg` | ✅ Pre-installed | Available in all Kaggle kernels |
+| `torch` + CUDA | ✅ Pre-installed | Enable GPU accelerator in notebook settings |
+| `depth-anything-3` | ✅ Ready | Installed from source via setup script (no PyPI release) |
+| `render_360.py` | ⚠️ Optional | 360° orbit rendering — skippable if `open3d` unavailable |
+| Disk space | ⚠️ Watch | DA3 model weights from HuggingFace can be 2–4 GB; Kaggle gives ~20 GB |
+
+---
+
 ### Prerequisites & Checkpoints
 
 - Ensure pretrained model checkpoints exist under `weights/`:
@@ -147,6 +178,7 @@ Follow these step-by-step instructions to run a complete pass from raw video to 
   - **Windows**: `winget install ffmpeg` or download from [ffmpeg.org](https://ffmpeg.org/download.html)
   - **macOS**: `brew install ffmpeg`
   - **Linux**: `sudo apt install ffmpeg`
+- **Depth Anything V3** is not published on PyPI — it must be installed from source (see [Step 1.3](#step-13--install-depth-anything-v3-from-source) below).
 
 ---
 
@@ -171,7 +203,42 @@ source .venv/bin/activate
 ```bash
 pip install -r requirements.txt
 ```
-*Key packages installed:* `torch`, `torchvision`, `open3d`, `trimesh`, `ultralytics` (YOLO11), `transformers` (DINOv2), `depth-anything-3`, `mobile-sam`, `scikit-learn`, `scipy`.
+*Key packages installed:* `torch`, `torchvision`, `open3d`, `trimesh`, `ultralytics` (YOLO11), `transformers` (DINOv2), `mobile-sam`, `scikit-learn`, `scipy`.
+
+> **Note**: `depth-anything-3` is intentionally excluded from `requirements.txt` — it has no official PyPI release. Install it from source in the next step.
+
+---
+
+#### 1.3 — Install Depth Anything V3 from Source
+
+Depth Anything V3 is published by ByteDance-Seed only as a GitHub repository with no PyPI package. It must be cloned and installed in editable mode **outside** the project directory:
+
+```bash
+# From a directory of your choice (e.g. one level above this project)
+git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git
+cd Depth-Anything-3
+pip install -e .
+```
+
+Alternatively, install directly from GitHub without cloning:
+
+```bash
+pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git
+```
+
+After installing, download the pretrained model weights using the provided script:
+
+```bash
+# Run from inside the cloned Depth-Anything-3 directory
+bash ./scripts/download_weights.sh
+```
+
+Verify the install succeeded:
+
+```python
+from depth_anything_3.api import DepthAnything3
+print("Depth Anything V3 installed successfully")
+```
 
 ---
 
@@ -301,9 +368,12 @@ Pipeline parameters can be customized in [`config.py`](config.py):
 | :--- | :--- | :--- |
 | `VIDEO_TARGET_LONG_EDGE` | `720` | Target long-edge resolution (px) for video normalization |
 | `VIDEO_TARGET_FPS` | `24` | Target output frame rate cap for video normalization |
-| `TARGET_CLASSES` | `chair, couch, tv, microwave, oven, refrigerator, dining table` | COCO object classes to detect and reconstruct |
+| `DEPTH_MODEL_ID` | `depth-anything/da3-base` | HuggingFace model repo ID for Depth Anything V3 |
+| `DEPTH_SAMPLE_STRIDE` | `8` | Sample 1 frame every N frames for DA3 joint inference |
+| `DEPTH_MAX_FRAMES` | `60` | Max frames fed simultaneously to DA3 (bounded by GPU VRAM) |
 | `DEPTH_METRIC_MIN / MAX` | `0.5m / 5.0m` | Metric depth clipping range for global depth normalization |
 | `VOXEL_SIZE_PCD` | `0.02m` | Voxel grid downsampling cell size for point cloud deduplication |
+| `TARGET_CLASSES` | `chair, couch, tv, microwave, oven, refrigerator, dining table` | COCO object classes to detect and reconstruct |
 | `DBSCAN_EPS` | `0.05m` | Clustering neighborhood radius for object point extraction |
 | `SIMILARITY_THRESHOLD` | `0.80` | DINOv2 cosine similarity threshold for visual object Re-ID |
 | `ALPHA_SHAPE_ALPHA` | `0.10m` | Alpha-Shape concavity parameter for 3D mesh surface generation |

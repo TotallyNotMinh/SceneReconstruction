@@ -8,8 +8,14 @@ import sys
 import math
 import numpy as np
 import cv2
-import open3d as o3d
 from pathlib import Path
+
+try:
+    import open3d as o3d
+    _O3D_AVAILABLE = True
+except ImportError:
+    o3d = None
+    _O3D_AVAILABLE = False
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -43,6 +49,12 @@ def create_360_trajectory(center, radius, num_frames, height_offset=0.2, look_at
 
 
 if __name__ == "__main__":
+    if not _O3D_AVAILABLE:
+        sys.exit(
+            "[ERROR] open3d is required for render_360.py but is not installed.\n"
+            "  On Kaggle/headless: apt-get install -y libgl1-mesa-glx && pip install open3d\n"
+            "  On desktop:         pip install open3d"
+        )
     if len(sys.argv) < 2:
         sys.exit("[ERROR] Please specify a 3D mesh or point cloud file (.ply, .obj, .glb) on the command line.\nUsage: python visualization/render_360.py <path_to_mesh_or_pcd>")
 

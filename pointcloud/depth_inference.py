@@ -38,7 +38,11 @@ except ImportError as _e:
 DEFAULT_NPZ_PATH = config.PROCESSED_DATA_DIR / "raw_depths.npz"
 
 
-def preprocess_video(video_path: Path, target_long_edge: int = 720, target_fps: int = 24) -> tuple[Path, dict]:
+def preprocess_video(
+    video_path: Path,
+    target_long_edge: int = config.VIDEO_TARGET_LONG_EDGE,
+    target_fps: int = config.VIDEO_TARGET_FPS,
+) -> tuple[Path, dict]:
     res = video_normalizer.normalize_and_preprocess_video(
         video_path, target_long_edge=target_long_edge, target_fps=target_fps
     )
@@ -49,7 +53,7 @@ def load_depth_anything_model(device=None):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model_id = "depth-anything/da3-base"
+    model_id = config.DEPTH_MODEL_ID
     print(f"[+] Loading Depth Anything V3 Base model ({model_id}) on {device}...")
     model = DepthAnything3.from_pretrained(model_id).to(device)
     model.eval()
@@ -58,8 +62,8 @@ def load_depth_anything_model(device=None):
 
 def run_depth_inference(
     video_path: Path,
-    sample_stride: int = 8,
-    max_frames: int = 60,
+    sample_stride: int = config.DEPTH_SAMPLE_STRIDE,
+    max_frames: int = config.DEPTH_MAX_FRAMES,
     npz_out: Path | None = None,
 ) -> Path:
     video_path = Path(video_path)

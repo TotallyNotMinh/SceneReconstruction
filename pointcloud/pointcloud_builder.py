@@ -7,6 +7,7 @@ import sys
 import io
 import json
 import numpy as np
+import cv2
 import trimesh
 from pathlib import Path
 from scipy.spatial import KDTree
