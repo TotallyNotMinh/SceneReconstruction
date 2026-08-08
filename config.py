@@ -49,6 +49,10 @@ TABLE_SNAP_TOLERANCE    = 0.35  # Vertical distance to snap object onto a table 
 ALPHA_SHAPE_ALPHA   = 0.10      # Tightness of alpha shape (m)
 ALPHA_MAX_FACES     = 5_000     # Quadric-decimate threshold if face count exceeds this
 
+# ── Video Normalizer ─────────────────────────────────────────────────────────
+VIDEO_TARGET_LONG_EDGE = 720    # Resize so the longer edge is this many pixels
+VIDEO_TARGET_FPS       = 24     # Cap output frame rate (clamped to source FPS)
+
 # ── ReID & Object Detection ──────────────────────────────────────────────────
 SIMILARITY_THRESHOLD  = 0.8     # DINOv2 Cosine similarity threshold for object Re-ID
 SAMPLE_EVERY_N_FRAMES = 5       # Sample 1 every 5 frames for Re-ID feature extraction

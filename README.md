@@ -175,23 +175,63 @@ pip install -r requirements.txt
 
 ---
 
-### Step 2 — Stage 1: Multi-View Depth & 3D Point Cloud Generation
+### Step 2 — Stage 1 Pass 1: Multi-View Depth & Pose Estimation
 
-Run Depth Anything V3 inference on your raw input video:
+Run Depth Anything V3 joint multi-view inference on your raw input video:
 
 ```bash
 python pointcloud/depth_inference.py data/raw/<dataset_id>/<dataset_id>.mov
 ```
 
+Optionally specify a custom output path for the raw depths archive:
+
+```bash
+python pointcloud/depth_inference.py data/raw/<dataset_id>/<dataset_id>.mov data/processed/raw_depths.npz
+```
+
 #### Internal Processing Steps:
-1. **Video Normalization**: Uses `core/video_normalizer.py` to fix orientation flags, downscale long-edge resolution to **720px** (Lanczos filtering), and update the intrinsic camera matrix $K$ (`scale_x`, `scale_y`).
-2. **Depth & Pose Estimation**: Runs Depth Anything V3 Base to estimate multi-view metric depth and frame camera poses.
-3. **Point Cloud Export**: Back-projects depth maps into global 3D space, applies voxel grid filtering, and exports the point cloud.
+1. **Video Normalization**: Uses `core/video_normalizer.py` to correct orientation flags, downscale the long edge to `VIDEO_TARGET_LONG_EDGE` (default **720px**) via Lanczos filtering, cap frame rate to `VIDEO_TARGET_FPS` (default **24 FPS**), and propagate exact per-axis `scale_x`/`scale_y` into the intrinsic matrix $K$.
+2. **Frame Sampling**: Samples one frame every `sample_stride` frames (default **8**), capped at `max_frames` (default **60**) to bound GPU VRAM usage during joint inference.
+3. **Joint Multi-View Depth & Pose Inference**: Feeds all sampled frames simultaneously to **Depth Anything V3** to produce globally consistent metric depth maps and predicted camera extrinsics/intrinsics for each frame.
+4. **Archive Export**: Saves all per-frame depth maps, RGB frames, predicted poses, intrinsics, and confidence maps into a compressed `.npz` archive. **No 3D point cloud is generated at this stage.**
 
 #### Generated Artifacts:
-- `data/output/world_pointcloud.ply` — Cleaned global 3D point cloud
-- `data/processed/ar_metadata.json` — Per-frame camera poses & rescaled intrinsics
-- `data/processed/depth_maps.npz` — Archive of processed depth arrays
+- `data/processed/raw_depths.npz` — Compressed archive of per-frame depth maps, predicted camera poses (`ext_i`), intrinsics (`ixt_i`), confidence maps (`conf_i`), and RGB frames (`rgb_i`)
+
+---
+
+### Step 2b — Stage 1 Pass 2: 3D Point Cloud Construction
+
+Back-project the saved depth maps into a global 3D point cloud:
+
+```bash
+python pointcloud/pointcloud_builder.py data/processed/raw_depths.npz
+```
+
+Optionally control point density via `point_step` (samples every Nth pixel per axis; lower = denser cloud, higher VRAM/memory usage):
+
+```bash
+python pointcloud/pointcloud_builder.py data/processed/raw_depths.npz <point_step>
+```
+
+#### Internal Processing Steps:
+1. **Load & Decode Archive**: Reads the `.npz` from Pass 1, extracting per-frame depth maps, camera poses, per-frame intrinsic matrices, RGB colors, and confidence maps.
+2. **Global Depth Normalization**: Computes global `min`/`max` across all frames and linearly maps raw depth values into the metric range `[DEPTH_METRIC_MIN, DEPTH_METRIC_MAX]` (default `0.5m – 5.0m`).
+3. **Confidence Filtering**: Discards the bottom 30th percentile of low-confidence pixels per frame before back-projection.
+4. **Camera-to-World Back-Projection**: For each sampled pixel at stride `point_step`, lifts the 2D pixel + depth value into a 3D camera-space ray using the per-frame intrinsic $K_i^{-1}$, then transforms to world space using the predicted camera-to-world matrix $[R|t]$.
+5. **Voxel Grid Downsampling**: Deduplicates points using a voxel grid of size `VOXEL_SIZE_PCD` (default **0.02m**) while preserving per-point RGB color.
+6. **Export**: Saves the cleaned, colored point cloud to both `data/processed/` and `data/output/` as `world_pointcloud.ply`, and writes `ar_metadata.json` with the camera intrinsics and per-frame pose records.
+
+#### Generated Artifacts:
+- `data/output/world_pointcloud.ply` — Cleaned, colored, downsampled global 3D point cloud
+- `data/processed/world_pointcloud.ply` — Intermediate copy used by downstream stages
+- `data/processed/ar_metadata.json` — Camera intrinsic matrix $K$, per-axis scale factors, and per-frame pose matrices
+
+> **Tip**: You can run both passes in one call from Python code using `generate_pcd_from_video()` in `pointcloud/depth_inference.py`:
+> ```python
+> from pointcloud.depth_inference import generate_pcd_from_video
+> pts, metadata = generate_pcd_from_video("data/raw/<id>/<id>.mov")
+> ```
 
 ---
 
@@ -259,9 +299,11 @@ Pipeline parameters can be customized in [`config.py`](config.py):
 
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
+| `VIDEO_TARGET_LONG_EDGE` | `720` | Target long-edge resolution (px) for video normalization |
+| `VIDEO_TARGET_FPS` | `24` | Target output frame rate cap for video normalization |
 | `TARGET_CLASSES` | `chair, couch, tv, microwave, oven, refrigerator, dining table` | COCO object classes to detect and reconstruct |
-| `DEPTH_METRIC_MIN / MAX` | `0.5m / 5.0m` | Metric depth clipping range |
-| `VOXEL_SIZE_PCD` | `0.02m` | Voxel grid downsampling resolution for point clouds |
+| `DEPTH_METRIC_MIN / MAX` | `0.5m / 5.0m` | Metric depth clipping range for global depth normalization |
+| `VOXEL_SIZE_PCD` | `0.02m` | Voxel grid downsampling cell size for point cloud deduplication |
 | `DBSCAN_EPS` | `0.05m` | Clustering neighborhood radius for object point extraction |
 | `SIMILARITY_THRESHOLD` | `0.80` | DINOv2 cosine similarity threshold for visual object Re-ID |
 | `ALPHA_SHAPE_ALPHA` | `0.10m` | Alpha-Shape concavity parameter for 3D mesh surface generation |

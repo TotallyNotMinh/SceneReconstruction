@@ -1,7 +1,14 @@
 # spatial/mesh_placer.py
+import sys
 from typing import Optional
 import numpy as np
 import trimesh
+from pathlib import Path
+
+# Add project root to sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import config
 from core.coordinate_adapter import CoordinateAdapter

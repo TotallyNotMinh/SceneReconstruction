@@ -26,6 +26,13 @@ import numpy as np
 from pathlib import Path
 from typing import Tuple, Dict, Any, Optional
 
+# Add project root to sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import config
+
 
 def get_scaled_resolution(width: int, height: int, target_long_edge: int = 720) -> Tuple[int, int, float, float]:
     """
@@ -171,8 +178,8 @@ def probe_video_orientation_and_meta(video_path: Path) -> Dict[str, Any]:
 def normalize_and_preprocess_video(
     video_path: Path,
     orig_intrinsics: Optional[list] = None,
-    target_long_edge: int = 720,
-    target_fps: int = 24,
+    target_long_edge: int = config.VIDEO_TARGET_LONG_EDGE,
+    target_fps: int = config.VIDEO_TARGET_FPS,
     is_prepackaged_dataset: bool = False,
 ) -> Dict[str, Any]:
     """
