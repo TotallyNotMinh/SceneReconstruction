@@ -24,9 +24,11 @@ YOLO_MODEL_PATH    = WEIGHTS_DIR / "yolo11m-seg.pt"
 SAM_CHECKPOINT_PATH = WEIGHTS_DIR / "mobile_sam.pt"
 
 # ── Point-cloud Processing ───────────────────────────────────────────────────
-VOXEL_SIZE_PCD     = 0.02      # Voxel grid cell size (m)
+VOXEL_SIZE_PCD     = 0.01      # Voxel grid cell size (m)
 DEPTH_METRIC_MIN   = 0.5       # Near clamp for metric depth (m)
 DEPTH_METRIC_MAX   = 5.0       # Far clamp for metric depth (m)
+ROR_RADIUS         = 0.05      # Radius Outlier Removal search radius (m)
+ROR_MIN_NEIGHBORS  = 5         # Radius Outlier Removal min neighbors inside radius
 
 # ── ObjectEstimator: Back-projection & Clustering ────────────────────────────
 DBSCAN_EPS              = 0.05  # DBSCAN neighbourhood radius (m)

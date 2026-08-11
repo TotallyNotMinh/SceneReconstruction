@@ -18,7 +18,7 @@ import config
 from core.coordinate_adapter import CoordinateAdapter
 from core.data_loader import DataLoader, _voxel_downsample, _remove_statistical_outliers
 from core.video_normalizer import get_scaled_resolution, rescale_intrinsics, rotate_intrinsics
-from pointcloud.pointcloud_builder import build_pointcloud_from_npz
+from pointcloud.pointcloud_builder import build_pointcloud_from_npz, _radius_outlier_removal, _cluster_outlier_removal
 
 
 class TestCoordinateAdapter(unittest.TestCase):
@@ -125,6 +125,68 @@ class TestPointcloudBuilder(unittest.TestCase):
             self.assertGreater(len(pts), 0)
             self.assertTrue(out_ply.exists())
             self.assertEqual(len(meta["frames"]), 2)
+
+
+class TestRadiusOutlierRemoval(unittest.TestCase):
+
+    def test_radius_outlier_removal_basic(self):
+        # A dense cluster of 6 points, and 1 isolated point far away
+        pts = np.array([
+            [0.0, 0.0, 0.0],
+            [0.01, 0.01, 0.01],
+            [0.02, 0.02, 0.02],
+            [0.01, 0.0, 0.0],
+            [0.0, 0.01, 0.0],
+            [0.0, 0.0, 0.01],
+            [5.0, 5.0, 5.0]  # Isolated point
+        ], dtype=np.float64)
+        
+        # cols: dummy rgb values
+        cols = np.ones((7, 3), dtype=np.uint8) * 255
+
+        # If search radius = 0.1m, and min_neighbors = 5
+        # The 6 points near origin each have 5 other points as neighbors (count >= 6).
+        # The isolated point has 0 neighbors (count = 1).
+        clean_pts, clean_cols = _radius_outlier_removal(pts, cols, radius=0.1, min_neighbors=5)
+
+        self.assertEqual(len(clean_pts), 6)
+        self.assertEqual(len(clean_cols), 6)
+        # Verify the isolated point was removed
+        for pt in clean_pts:
+            self.assertNotEqual(pt[0], 5.0)
+
+    def test_radius_outlier_removal_empty(self):
+        pts = np.zeros((0, 3), dtype=np.float64)
+        clean_pts, _ = _radius_outlier_removal(pts, None, radius=0.1, min_neighbors=5)
+        self.assertEqual(len(clean_pts), 0)
+
+
+class TestClusterOutlierRemoval(unittest.TestCase):
+
+    def test_dbscan_removes_isolated_noise(self):
+        rng = np.random.default_rng(42)
+        # Dense cluster of 200 tightly packed points around origin
+        dense = rng.uniform(-0.1, 0.1, size=(200, 3))
+        # 5 isolated noise points far away
+        noise = np.array([[5.0, 5.0, 5.0], [6.0, 6.0, 6.0], [-5.0, -5.0, -5.0],
+                          [7.0, 0.0, 0.0], [0.0, 7.0, 0.0]], dtype=np.float64)
+        pts = np.vstack([dense, noise])
+        cols = (np.ones((len(pts), 3)) * 128).astype(np.uint8)
+
+        clean_pts, clean_cols = _cluster_outlier_removal(
+            pts, cols, eps=0.3, min_samples=5, min_cluster_size=50
+        )
+        # Noise points should be removed; the 200-point cluster should survive
+        self.assertGreaterEqual(len(clean_pts), 150)
+        # None of the isolated noise points should survive
+        for pt in clean_pts:
+            self.assertLess(np.max(np.abs(pt)), 3.0)
+        self.assertEqual(len(clean_pts), len(clean_cols))
+
+    def test_dbscan_empty(self):
+        pts = np.zeros((0, 3), dtype=np.float64)
+        clean_pts, _ = _cluster_outlier_removal(pts, None, eps=0.1, min_samples=5, min_cluster_size=10)
+        self.assertEqual(len(clean_pts), 0)
 
 
 if __name__ == "__main__":

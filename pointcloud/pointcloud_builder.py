@@ -11,6 +11,7 @@ import cv2
 import trimesh
 from pathlib import Path
 from scipy.spatial import KDTree
+from sklearn.cluster import DBSCAN
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -72,6 +73,52 @@ def _statistical_outlier_removal(
     return pts_out, cols_out
 
 
+def _radius_outlier_removal(
+    pts: np.ndarray,
+    cols: np.ndarray | None = None,
+    radius: float = 0.05,
+    min_neighbors: int = 5,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Remove points that have fewer than min_neighbors within the search radius."""
+    if len(pts) <= min_neighbors:
+        return pts, cols
+    tree = KDTree(pts)
+    counts = tree.query_ball_point(pts, r=radius, return_length=True)
+    mask = counts >= (min_neighbors + 1)
+    pts_out = pts[mask]
+    cols_out = cols[mask] if cols is not None else None
+    return pts_out, cols_out
+
+
+def _cluster_outlier_removal(
+    pts: np.ndarray,
+    cols: np.ndarray | None = None,
+    eps: float = 0.05,
+    min_samples: int = 10,
+    min_cluster_size: int = 50,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Remove DBSCAN noise points and clusters smaller than min_cluster_size.
+
+    Points with label -1 (noise) and points belonging to clusters with fewer
+    than min_cluster_size members are discarded as outliers.
+    """
+    if len(pts) < min_samples:
+        return pts, cols
+    labels = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1).fit_predict(pts)
+    unique_labels, label_counts = np.unique(labels[labels >= 0], return_counts=True)
+    valid_clusters = unique_labels[label_counts >= min_cluster_size]
+    if len(valid_clusters) == 0:
+        # Fallback: keep the single largest cluster to avoid wiping everything
+        if len(unique_labels) > 0:
+            valid_clusters = unique_labels[np.argmax(label_counts):np.argmax(label_counts) + 1]
+        else:
+            return pts, cols
+    mask = np.isin(labels, valid_clusters)
+    pts_out = pts[mask]
+    cols_out = cols[mask] if cols is not None else None
+    return pts_out, cols_out
+
+
 def build_pointcloud_from_npz(
     npz_path: Path | str,
     point_step: int = 4,
@@ -82,6 +129,11 @@ def build_pointcloud_from_npz(
     conf_percentile: float = 0.0,
     sor_neighbors: int = 20,
     sor_std_ratio: float = 2.0,
+    ror_radius: float = 0.0,
+    ror_min_neighbors: int = 0,
+    dbscan_eps: float = 0.0,
+    dbscan_min_samples: int = 10,
+    dbscan_min_cluster_size: int = 50,
     no_clean: bool = False,
     out_ply: Path | str | None = None,
 ):
@@ -168,24 +220,26 @@ def build_pointcloud_from_npz(
                 H_mat[:3, :4] = ext_w2c
                 ext_w2c = H_mat
             c2w = np.linalg.pinv(ext_w2c)
+            # Convert OpenCV world coordinates (+Y Down) to Y-Up World coordinates (+Y Up)
+            R_flip = np.diag([1.0, -1.0, -1.0, 1.0])
+            c2w = R_flip @ c2w
         else:
             pose = np.array(frames_meta[i]["pose_matrix"]) if i < len(frames_meta) else np.eye(4)
             c2w = pose
 
-        if i < len(frames_meta):
-            frames_metadata_out.append(frames_meta[i])
-        else:
-            f_dict = {
-                "index": int(frame_idx),
-                "pose_matrix": c2w.tolist(),
-                "fl_x": float(K_i[0, 0]),
-                "fl_y": float(K_i[1, 1]),
-                "cx": float(K_i[0, 2]),
-                "cy": float(K_i[1, 2]),
-                "w": int(W),
-                "h": int(H),
-            }
-            frames_metadata_out.append(f_dict)
+        f_meta = dict(frames_meta[i]) if i < len(frames_meta) else {}
+        f_dict = {
+            "index": int(frame_idx),
+            "pose_matrix": c2w.tolist(),
+            "fl_x": float(K_i[0, 0]),
+            "fl_y": float(K_i[1, 1]),
+            "cx": float(K_i[0, 2]),
+            "cy": float(K_i[1, 2]),
+            "w": int(W),
+            "h": int(H),
+        }
+        f_meta.update(f_dict)
+        frames_metadata_out.append(f_meta)
 
         us = np.arange(0, W, point_step)
         vs = np.arange(0, H, point_step)
@@ -249,10 +303,29 @@ def build_pointcloud_from_npz(
     else:
         pts_clean, cols_clean = _voxel_downsample_centroid(pts_concat, cols_concat, voxel_size=voxel_size)
         if sor_neighbors > 0 and sor_std_ratio > 0:
+            n_before = len(pts_clean)
             print(f"[+] Applying Statistical Outlier Removal (k={sor_neighbors}, std_ratio={sor_std_ratio})...")
             pts_clean, cols_clean = _statistical_outlier_removal(
                 pts_clean, cols_clean, nb_neighbors=sor_neighbors, std_ratio=sor_std_ratio
             )
+            print(f"    Removed {n_before - len(pts_clean):,} points.")
+        if ror_radius > 0 and ror_min_neighbors > 0:
+            n_before = len(pts_clean)
+            print(f"[+] Applying Radius Outlier Removal (radius={ror_radius}, min_neighbors={ror_min_neighbors})...")
+            pts_clean, cols_clean = _radius_outlier_removal(
+                pts_clean, cols_clean, radius=ror_radius, min_neighbors=ror_min_neighbors
+            )
+            print(f"    Removed {n_before - len(pts_clean):,} points.")
+        if dbscan_eps > 0:
+            n_before = len(pts_clean)
+            print(f"[+] Applying DBSCAN Cluster Outlier Removal (eps={dbscan_eps}, min_samples={dbscan_min_samples}, min_cluster_size={dbscan_min_cluster_size})...")
+            pts_clean, cols_clean = _cluster_outlier_removal(
+                pts_clean, cols_clean,
+                eps=dbscan_eps,
+                min_samples=dbscan_min_samples,
+                min_cluster_size=dbscan_min_cluster_size,
+            )
+            print(f"    Removed {n_before - len(pts_clean):,} points.")
 
     print(f"[+] Points after cleaning: {len(pts_clean):,}")
 
@@ -306,6 +379,13 @@ if __name__ == "__main__":
     parser.add_argument("--step", "--point-step", type=int, default=4, dest="step", help="Pixel stride per frame (default: 4, 1 = full resolution)")
     parser.add_argument("--voxel-size", type=float, default=config.VOXEL_SIZE_PCD, help="Voxel downsampling size in meters (default: 0.02)")
     parser.add_argument("--conf-percentile", type=float, default=0.0, help="Confidence percentile threshold (default: 0.0 = no clipping, 30.0 = drop bottom 30%%)")
+    parser.add_argument("--sor-neighbors", type=int, default=20, help="Statistical outlier removal number of neighbors (default: 20)")
+    parser.add_argument("--sor-std-ratio", type=float, default=2.0, help="Statistical outlier removal standard deviation ratio (default: 2.0)")
+    parser.add_argument("--ror-radius", type=float, default=config.ROR_RADIUS, help="Radius outlier removal search radius in meters (default: from config)")
+    parser.add_argument("--ror-min-neighbors", type=int, default=config.ROR_MIN_NEIGHBORS, help="Radius outlier removal minimum neighbors inside radius (default: from config)")
+    parser.add_argument("--dbscan-eps", type=float, default=0.0, help="DBSCAN cluster outlier removal epsilon radius in meters (default: 0 = disabled)")
+    parser.add_argument("--dbscan-min-samples", type=int, default=10, help="DBSCAN minimum samples to form a core point (default: 10)")
+    parser.add_argument("--dbscan-min-cluster-size", type=int, default=50, help="DBSCAN minimum cluster size to keep (default: 50)")
     parser.add_argument("--no-clean", action="store_true", help="Skip voxel downsampling and save raw unmerged points")
     parser.add_argument("--out", "--output", type=str, default=None, dest="out", help="Custom output .ply path")
     args = parser.parse_args()
@@ -316,6 +396,13 @@ if __name__ == "__main__":
         point_step=args.step,
         voxel_size=args.voxel_size,
         conf_percentile=args.conf_percentile,
+        sor_neighbors=args.sor_neighbors,
+        sor_std_ratio=args.sor_std_ratio,
+        ror_radius=args.ror_radius,
+        ror_min_neighbors=args.ror_min_neighbors,
+        dbscan_eps=args.dbscan_eps,
+        dbscan_min_samples=args.dbscan_min_samples,
+        dbscan_min_cluster_size=args.dbscan_min_cluster_size,
         no_clean=args.no_clean,
         out_ply=args.out,
     )
