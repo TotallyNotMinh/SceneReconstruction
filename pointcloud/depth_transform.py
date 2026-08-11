@@ -24,7 +24,7 @@ def extract_timestamp(path: Path) -> float:
             f"Kỳ vọng dạng 'sessionID_timestamp.png'."
         )
 def remove_flying_pixels(depth: np.ndarray, rel_threshold: float = 0.15, median_ksize: int = 5) -> np.ndarray:
-        valid_mask = depth > 0
+    valid_mask = depth > 0
     depth_for_median = depth.copy()
     depth_for_median[~valid_mask] = 0
 
