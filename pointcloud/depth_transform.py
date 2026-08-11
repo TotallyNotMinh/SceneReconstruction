@@ -11,11 +11,7 @@ import config
 
 def process_to_single_npz(INPUT_DIR = PROJECT_ROOT / "highres_depth"):
     OUTPUT_FILE = config.PROCESSED_DATA_DIR / "raw_depths.npz"
-
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    all_depths = []
-    file_names = []
 
     image_files = sorted(list(INPUT_DIR.glob("*.png")))
 
@@ -25,28 +21,28 @@ def process_to_single_npz(INPUT_DIR = PROJECT_ROOT / "highres_depth"):
 
     print(f"Bắt đầu gộp {len(image_files)} file ảnh...")
 
-    for img_path in image_files:
+    data_to_save = {}
+    file_names = []
+
+    for index, img_path in enumerate(image_files):
         depth_map = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
 
         if depth_map is not None:
             depth_array = np.array(depth_map, dtype=np.float32)
 
-            all_depths.append(depth_array)
+            data_to_save[f"depth_{index}"] = depth_array
+
             file_names.append(img_path.name)
-            print(f"  -> Đã đọc: {img_path.name}")
+            print(f"  -> Đã đọc: {img_path.name} (lưu thành depth_{index})")
         else:
             print(f"  [LỖI] Không thể đọc file: {img_path.name}")
 
-    if all_depths:
-        stacked_depths = np.stack(all_depths)
+    if data_to_save:
+        data_to_save['filenames'] = file_names
 
-        np.savez_compressed(
-            OUTPUT_FILE,
-            depths=stacked_depths,
-            filenames=file_names
-        )
+        np.savez_compressed(OUTPUT_FILE, **data_to_save)
 
-        print(f"\n[THÀNH CÔNG] Đã lưu mảng với kích thước {stacked_depths.shape} vào:")
+        print(f"\n[THÀNH CÔNG] Đã lưu {len(file_names)} mảng depth riêng biệt vào:")
         print(f"  {OUTPUT_FILE}")
 
 if __name__ == "__main__":
