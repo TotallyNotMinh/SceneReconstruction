@@ -22,30 +22,54 @@ import config
 DEFAULT_NPZ_PATH = config.PROCESSED_DATA_DIR / "raw_depths.npz"
 
 
-def _voxel_downsample(pts: np.ndarray, voxel_size: float = 0.02) -> np.ndarray:
+def _voxel_downsample_centroid(
+    pts: np.ndarray,
+    colors: np.ndarray | None = None,
+    voxel_size: float = 0.02,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Compute mean 3D position and mean RGB color per 3D voxel cell."""
     if len(pts) == 0:
-        return pts
-    voxel_ids = np.floor(pts / voxel_size).astype(np.int64)
-    shift = voxel_ids.max(axis=0) - voxel_ids.min(axis=0) + 1
-    keys  = (voxel_ids[:, 0] * shift[1] * shift[2]
-             + voxel_ids[:, 1] * shift[2]
-             + voxel_ids[:, 2])
-    _, first = np.unique(keys, return_index=True)
-    return pts[first]
+        return pts, colors
+
+    voxel_coords = np.floor(pts / voxel_size).astype(np.int64)
+    unique_voxels, inverse_indices = np.unique(voxel_coords, axis=0, return_inverse=True)
+    m_voxels = len(unique_voxels)
+
+    counts = np.bincount(inverse_indices, minlength=m_voxels)[:, None]
+    x_sum = np.bincount(inverse_indices, weights=pts[:, 0], minlength=m_voxels)[:, None]
+    y_sum = np.bincount(inverse_indices, weights=pts[:, 1], minlength=m_voxels)[:, None]
+    z_sum = np.bincount(inverse_indices, weights=pts[:, 2], minlength=m_voxels)[:, None]
+    pts_mean = np.hstack([x_sum, y_sum, z_sum]) / np.maximum(counts, 1)
+
+    if colors is not None:
+        r_sum = np.bincount(inverse_indices, weights=colors[:, 0].astype(np.float64), minlength=m_voxels)[:, None]
+        g_sum = np.bincount(inverse_indices, weights=colors[:, 1].astype(np.float64), minlength=m_voxels)[:, None]
+        b_sum = np.bincount(inverse_indices, weights=colors[:, 2].astype(np.float64), minlength=m_voxels)[:, None]
+        cols_mean = np.hstack([r_sum, g_sum, b_sum]) / np.maximum(counts, 1)
+        cols_mean = np.clip(cols_mean, 0, 255).astype(np.uint8)
+    else:
+        cols_mean = None
+
+    return pts_mean, cols_mean
 
 
 def _statistical_outlier_removal(
     pts: np.ndarray,
+    cols: np.ndarray | None = None,
     nb_neighbors: int = 20,
     std_ratio: float = 2.0,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Remove points whose mean k-NN distance exceeds mean + std_ratio * std."""
     if len(pts) <= nb_neighbors:
-        return pts
-    tree       = KDTree(pts)
-    dists, _   = tree.query(pts, k=nb_neighbors + 1)
+        return pts, cols
+    tree = KDTree(pts)
+    dists, _ = tree.query(pts, k=nb_neighbors + 1)
     mean_dists = dists[:, 1:].mean(axis=1)
-    threshold  = mean_dists.mean() + std_ratio * mean_dists.std()
-    return pts[mean_dists <= threshold]
+    threshold = mean_dists.mean() + std_ratio * mean_dists.std()
+    mask = mean_dists <= threshold
+    pts_out = pts[mask]
+    cols_out = cols[mask] if cols is not None else None
+    return pts_out, cols_out
 
 
 def build_pointcloud_from_npz(
@@ -55,8 +79,11 @@ def build_pointcloud_from_npz(
     depth_metric_min: float = config.DEPTH_METRIC_MIN,
     depth_metric_max: float = config.DEPTH_METRIC_MAX,
     voxel_size: float = config.VOXEL_SIZE_PCD,
+    conf_percentile: float = 0.0,
     sor_neighbors: int = 20,
     sor_std_ratio: float = 2.0,
+    no_clean: bool = False,
+    out_ply: Path | str | None = None,
 ):
     npz_path = Path(npz_path)
     if not npz_path.exists():
@@ -73,8 +100,9 @@ def build_pointcloud_from_npz(
     if not depth_keys:
         sys.exit("[ERROR] No depth arrays found in the .npz file.")
 
+    frame_indices = [int(k.split("_", 1)[1]) for k in depth_keys]
     n_frames = len(depth_keys)
-    raw_depths = [npz[f"depth_{i}"] for i in range(n_frames)]
+    raw_depths = [npz[k] for k in depth_keys]
 
     # Safe metadata extraction with fallback to raw frame shapes
     if "video_w" in npz and "video_h" in npz:
@@ -95,10 +123,10 @@ def build_pointcloud_from_npz(
         frames_meta: list = json.loads(npz["frames_meta"].tobytes().decode("utf-8"))
     else:
         frames_meta = []
-    ext_keys   = [f"ext_{i}" for i in range(n_frames) if f"ext_{i}" in npz]
-    ixt_keys   = [f"ixt_{i}" for i in range(n_frames) if f"ixt_{i}" in npz]
-    rgb_keys   = [f"rgb_{i}" for i in range(n_frames) if f"rgb_{i}" in npz]
-    conf_keys  = [f"conf_{i}" for i in range(n_frames) if f"conf_{i}" in npz]
+    ext_keys   = [f"ext_{idx}" for idx in frame_indices if f"ext_{idx}" in npz]
+    ixt_keys   = [f"ixt_{idx}" for idx in frame_indices if f"ixt_{idx}" in npz]
+    rgb_keys   = [f"rgb_{idx}" for idx in frame_indices if f"rgb_{idx}" in npz]
+    conf_keys  = [f"conf_{idx}" for idx in frame_indices if f"conf_{idx}" in npz]
 
     print(f"[+] {n_frames} frames loaded from archive.")
 
@@ -122,23 +150,24 @@ def build_pointcloud_from_npz(
     frames_metadata_out: list = []
 
     for i in range(n_frames):
+        frame_idx = frame_indices[i]
         depth_map = raw_depths[i].astype(np.float64)
-        depth_maps_out[i] = depth_map
+        depth_maps_out[frame_idx] = depth_map
 
         H, W = depth_map.shape
 
-        if has_predicted_poses and i < len(ixt_keys):
-            K_i = npz[f"ixt_{i}"].astype(np.float64)
+        if has_predicted_poses and f"ixt_{frame_idx}" in npz:
+            K_i = npz[f"ixt_{frame_idx}"].astype(np.float64)
         else:
             K_i = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
 
-        if has_predicted_poses:
-            ext_w2c = npz[f"ext_{i}"].astype(np.float64)
+        if has_predicted_poses and f"ext_{frame_idx}" in npz:
+            ext_w2c = npz[f"ext_{frame_idx}"].astype(np.float64)
             if ext_w2c.shape == (3, 4):
                 H_mat = np.eye(4, dtype=np.float64)
                 H_mat[:3, :4] = ext_w2c
                 ext_w2c = H_mat
-            c2w = np.linalg.inv(ext_w2c)
+            c2w = np.linalg.pinv(ext_w2c)
         else:
             pose = np.array(frames_meta[i]["pose_matrix"]) if i < len(frames_meta) else np.eye(4)
             c2w = pose
@@ -147,7 +176,7 @@ def build_pointcloud_from_npz(
             frames_metadata_out.append(frames_meta[i])
         else:
             f_dict = {
-                "index": int(i),
+                "index": int(frame_idx),
                 "pose_matrix": c2w.tolist(),
                 "fl_x": float(K_i[0, 0]),
                 "fl_y": float(K_i[1, 1]),
@@ -165,10 +194,10 @@ def build_pointcloud_from_npz(
         d_vals = depth_map[vv, uu].ravel()
         valid = np.isfinite(d_vals) & (d_vals > 0)
 
-        if len(conf_keys) == n_frames:
-            conf_map = npz[f"conf_{i}"]
+        if len(conf_keys) == n_frames and conf_percentile > 0 and f"conf_{frame_idx}" in npz:
+            conf_map = npz[f"conf_{frame_idx}"]
             conf_vals = conf_map[vv, uu].ravel()
-            conf_thr = np.percentile(conf_vals, 30.0)
+            conf_thr = np.percentile(conf_vals, float(conf_percentile))
             valid &= (conf_vals >= conf_thr)
 
         if not np.any(valid):
@@ -179,13 +208,13 @@ def build_pointcloud_from_npz(
         d_v  = d_vals[valid]
 
         pix = np.stack([uu_v, vv_v, np.ones_like(uu_v)], axis=-1)
-        K_inv = np.linalg.inv(K_i)
+        K_inv = np.linalg.pinv(K_i)
         rays = (K_inv @ pix.T)
 
         Xc = rays * d_v[None, :]
         Xc_h = np.vstack([Xc, np.ones((1, Xc.shape[1]))])
 
-        if has_predicted_poses:
+        if has_predicted_poses and f"ext_{frame_idx}" in npz:
             Xw = (c2w @ Xc_h)[:3].T
         else:
             pts_cam_arkit = Xc.T.copy()
@@ -196,8 +225,8 @@ def build_pointcloud_from_npz(
 
         all_world_points.append(Xw)
 
-        if has_colors:
-            rgb_map = npz[f"rgb_{i}"]
+        if has_colors and f"rgb_{frame_idx}" in npz:
+            rgb_map = npz[f"rgb_{frame_idx}"]
             if rgb_map.shape[:2] != (H, W):
                 rgb_map = cv2.resize(rgb_map, (W, H))
             colors_v = rgb_map[vv_v, uu_v]
@@ -214,18 +243,16 @@ def build_pointcloud_from_npz(
     else:
         cols_concat = None
 
-    if cols_concat is not None:
-        voxel_ids = np.floor(pts_concat / voxel_size).astype(np.int64)
-        shift = voxel_ids.max(axis=0) - voxel_ids.min(axis=0) + 1
-        keys  = (voxel_ids[:, 0] * shift[1] * shift[2]
-                 + voxel_ids[:, 1] * shift[2]
-                 + voxel_ids[:, 2])
-        _, first = np.unique(keys, return_index=True)
-        pts_clean  = pts_concat[first]
-        cols_clean = cols_concat[first]
+    if no_clean:
+        pts_clean = pts_concat
+        cols_clean = cols_concat
     else:
-        pts_clean  = _voxel_downsample(pts_concat, voxel_size=voxel_size)
-        cols_clean = None
+        pts_clean, cols_clean = _voxel_downsample_centroid(pts_concat, cols_concat, voxel_size=voxel_size)
+        if sor_neighbors > 0 and sor_std_ratio > 0:
+            print(f"[+] Applying Statistical Outlier Removal (k={sor_neighbors}, std_ratio={sor_std_ratio})...")
+            pts_clean, cols_clean = _statistical_outlier_removal(
+                pts_clean, cols_clean, nb_neighbors=sor_neighbors, std_ratio=sor_std_ratio
+            )
 
     print(f"[+] Points after cleaning: {len(pts_clean):,}")
 
@@ -237,8 +264,15 @@ def build_pointcloud_from_npz(
     else:
         cloud = trimesh.PointCloud(vertices=pts_clean)
     
-    for ply_path in (config.PROCESSED_DATA_DIR / "world_pointcloud.ply",
-                     config.OUTPUT_DIR / "world_pointcloud.ply"):
+    target_ply_paths = [
+        config.PROCESSED_DATA_DIR / "world_pointcloud.ply",
+        config.OUTPUT_DIR / "world_pointcloud.ply"
+    ]
+    if out_ply is not None:
+        target_ply_paths.append(Path(out_ply))
+
+    for ply_path in target_ply_paths:
+        ply_path.parent.mkdir(parents=True, exist_ok=True)
         cloud.export(str(ply_path))
     print(f"[+] OK Point cloud saved ({len(pts_clean):,} pts) -> {config.OUTPUT_DIR / 'world_pointcloud.ply'}")
 
@@ -271,7 +305,17 @@ if __name__ == "__main__":
     parser.add_argument("npz", type=str, nargs="?", default=str(DEFAULT_NPZ_PATH), help="Path to raw_depths.npz file")
     parser.add_argument("--step", "--point-step", type=int, default=4, dest="step", help="Pixel stride per frame (default: 4, 1 = full resolution)")
     parser.add_argument("--voxel-size", type=float, default=config.VOXEL_SIZE_PCD, help="Voxel downsampling size in meters (default: 0.02)")
+    parser.add_argument("--conf-percentile", type=float, default=0.0, help="Confidence percentile threshold (default: 0.0 = no clipping, 30.0 = drop bottom 30%%)")
+    parser.add_argument("--no-clean", action="store_true", help="Skip voxel downsampling and save raw unmerged points")
+    parser.add_argument("--out", "--output", type=str, default=None, dest="out", help="Custom output .ply path")
     args = parser.parse_args()
 
     _npz = Path(args.npz)
-    build_pointcloud_from_npz(_npz, point_step=args.step, voxel_size=args.voxel_size)
+    build_pointcloud_from_npz(
+        _npz,
+        point_step=args.step,
+        voxel_size=args.voxel_size,
+        conf_percentile=args.conf_percentile,
+        no_clean=args.no_clean,
+        out_ply=args.out,
+    )

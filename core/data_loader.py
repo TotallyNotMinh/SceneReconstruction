@@ -12,16 +12,13 @@ from core.coordinate_adapter import CoordinateAdapter
 # ── Pure-numpy helpers (no open3d) ────────────────────────────────────────────
 
 def _voxel_downsample(pts: np.ndarray, voxel_size: float = 0.02) -> np.ndarray:
-    """Keep one point per voxel cell using a numpy integer-key hash."""
+    """Keep one point per voxel cell using numpy unique on 3D integer voxel indices."""
     if len(pts) == 0:
         return pts
     voxel_ids = np.floor(pts / voxel_size).astype(np.int64)
-    shift = voxel_ids.max(axis=0) - voxel_ids.min(axis=0) + 1
-    keys = (voxel_ids[:, 0] * shift[1] * shift[2]
-            + voxel_ids[:, 1] * shift[2]
-            + voxel_ids[:, 2])
-    _, first = np.unique(keys, return_index=True)
+    _, first = np.unique(voxel_ids, axis=0, return_index=True)
     return pts[first]
+
 
 
 def _remove_statistical_outliers(
@@ -118,7 +115,14 @@ class DataLoader:
             raise FileNotFoundError(f"Depth maps file not found: {npz_path}")
 
         npz = np.load(str(npz_path))
-        depth_maps = {int(k): npz[k].astype(np.float64) for k in npz.files if k.isdigit() or k.startswith("depth_")}
+        depth_maps = {}
+        for k in npz.files:
+            if k.isdigit():
+                depth_maps[int(k)] = npz[k].astype(np.float64)
+            elif k.startswith("depth_"):
+                idx_str = k.split("_", 1)[1]
+                if idx_str.isdigit():
+                    depth_maps[int(idx_str)] = npz[k].astype(np.float64)
         print(f"[DataLoader] Loaded {len(depth_maps)} depth maps from {npz_path.name}")
         return depth_maps
 
@@ -130,6 +134,9 @@ class DataLoader:
             raise FileNotFoundError(f"Video not found: {video_path}")
 
         cap = _cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video file: {video_path}")
+
         total = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT))
 
         rgb_frames: dict = {}

@@ -149,7 +149,11 @@ def probe_video_orientation_and_meta(video_path: Path) -> Dict[str, Any]:
 
     r_fps = stream.get("r_frame_rate", "30/1")
     num, _, den = r_fps.partition("/")
-    fps = float(num) / float(den) if den and float(den) > 0 else float(num)
+    try:
+        fps_val = float(num) / float(den) if den and float(den) > 0 else float(num)
+        fps = fps_val if fps_val > 0 else 30.0
+    except (ValueError, ZeroDivisionError):
+        fps = 30.0
 
     rotation = 0
     side_data_list = stream.get("side_data_list", [])
