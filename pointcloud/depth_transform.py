@@ -23,13 +23,22 @@ def extract_timestamp(path: Path) -> float:
             f"Không parse được timestamp từ tên file: '{path.name}'. "
             f"Kỳ vọng dạng 'sessionID_timestamp.png'."
         )
+def remove_flying_pixels(depth: np.ndarray, threshold: float = 0.05, kernel_size: int = 3) -> np.ndarray:
+    depth_clean = depth.copy()
 
+    # tính gradient theo 2 hướng
+    grad_x = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=kernel_size)
+    grad_y = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=kernel_size)
+    grad_mag = np.sqrt(grad_x**2 + grad_y**2)
 
+    edge_mask = grad_mag > threshold
+    depth_clean[edge_mask] = 0.0
+
+    return depth_clean
 def process_to_single_npz(INPUT_DIR: Path = PROJECT_ROOT / "highres_depth"):
     OUTPUT_FILE = config.PROCESSED_DATA_DIR / "raw_depths.npz"
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    # QUAN TRỌNG: sort theo timestamp thực (float), không theo string mặc định
     image_files = sorted(INPUT_DIR.glob("*.png"), key=extract_timestamp)
     if not image_files:
         print(f"Không tìm thấy file ảnh .png nào trong {INPUT_DIR}")
@@ -49,7 +58,7 @@ def process_to_single_npz(INPUT_DIR: Path = PROJECT_ROOT / "highres_depth"):
             continue
 
         depth_array = np.asarray(depth_map, dtype=np.float32)
-
+        depth_array = remove_flying_pixels(depth_array, threshold=0.05)
         if ref_shape is None:
             ref_shape = depth_array.shape
         elif depth_array.shape != ref_shape:
