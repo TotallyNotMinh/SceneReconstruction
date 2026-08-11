@@ -189,5 +189,98 @@ class TestClusterOutlierRemoval(unittest.TestCase):
         self.assertEqual(len(clean_pts), 0)
 
 
+from pointcloud.filters import (
+    edge_filter_depth_map,
+    grazing_angle_filter_depth_map,
+    free_space_violation_filter,
+    tsdf_fuse,
+)
+
+
+class TestFilters(unittest.TestCase):
+
+    def test_edge_filter_depth_map(self):
+        # Create a depth map with a sharp step boundary (depth discontinuity)
+        D = np.ones((50, 50), dtype=np.float64) * 2.0
+        D[:, 25:] = 5.0  # Sharp step from 2.0 to 5.0 at column 25
+
+        filtered_D = edge_filter_depth_map(D, alpha=0.05, dilate_iters=1)
+        # Edge pixels around column 24-26 should be invalidated (set to 0)
+        self.assertEqual(filtered_D[:, 24].sum(), 0.0)
+        self.assertEqual(filtered_D[:, 25].sum(), 0.0)
+        # Smooth regions away from boundary should remain unmasked
+        self.assertTrue(np.all(filtered_D[:, 5] == 2.0))
+        self.assertTrue(np.all(filtered_D[:, 40] == 5.0))
+
+    def test_grazing_angle_filter_depth_map(self):
+        # Create a depth map of a sphere/cylinder where edges have steep grazing angles relative to camera ray
+        H, W = 100, 100
+        K = np.array([[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        
+        # A hemisphere at center
+        u = np.arange(W)
+        v = np.arange(H)
+        uu, vv = np.meshgrid(u, v)
+        r_sq = (uu - 50)**2 + (vv - 50)**2
+        R_sq = 40**2
+        mask = r_sq < R_sq
+        
+        D = np.zeros((H, W), dtype=np.float64)
+        D[mask] = 2.0 - np.sqrt(R_sq - r_sq[mask]) * 0.02
+        
+        filtered_D = grazing_angle_filter_depth_map(D, K, max_angle_deg=60.0)
+        # Center of hemisphere has normal pointing back at camera (low grazing angle) -> kept
+        self.assertGreater(filtered_D[50, 50], 0.0)
+        # Outer boundary of hemisphere has steep grazing angle -> filtered out (set to 0)
+        valid_before = np.count_nonzero(D > 0)
+        valid_after = np.count_nonzero(filtered_D > 0)
+        self.assertLess(valid_after, valid_before)
+
+    def test_free_space_violation_filter(self):
+
+        # Frame at origin looking along +Z (identity pose)
+        c2w = np.eye(4, dtype=np.float64)
+        K = np.array([[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        D = np.ones((100, 100), dtype=np.float64) * 2.0  # Observed depth is at Z=2.0m
+
+        # Point A at Z=2.0 (consistent with observed surface)
+        # Point B at Z=4.0 (behind observed surface at Z=2.0 -> free space violation)
+        pts = np.array([
+            [0.0, 0.0, 2.0],  # Valid point at surface
+            [0.0, 0.0, 4.0],  # Flying pixel / streak artifact behind surface
+        ], dtype=np.float64)
+        cols = np.array([[255, 0, 0], [0, 255, 0]], dtype=np.uint8)
+
+        frames_info = [{"depth": D, "c2w": c2w, "K": K}]
+
+        clean_pts, clean_cols = free_space_violation_filter(
+            pts, cols, frames_info, margin=0.1, violation_ratio=0.5
+        )
+
+        # Point B (Z=4.0) should be removed as a free space violation
+        self.assertEqual(len(clean_pts), 1)
+        np.testing.assert_almost_equal(clean_pts[0], [0.0, 0.0, 2.0])
+
+    def test_tsdf_fuse_integration(self):
+        # Create 2 simple synthetic frames looking at a plane at Z=2.0
+        c2w_1 = np.eye(4, dtype=np.float64)
+        c2w_2 = np.eye(4, dtype=np.float64)
+        c2w_2[0, 3] = 0.1  # Slight camera shift on X axis
+
+        K = np.array([[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        D = np.ones((100, 100), dtype=np.float32) * 2.0
+        RGB = np.ones((100, 100, 3), dtype=np.uint8) * 200
+
+        frames_info = [
+            {"depth": D, "rgb": RGB, "c2w": c2w_1, "K": K},
+            {"depth": D, "rgb": RGB, "c2w": c2w_2, "K": K},
+        ]
+
+        pts, cols = tsdf_fuse(frames_info, voxel_length=0.05, sdf_trunc=0.15, depth_max=4.0)
+        self.assertGreater(len(pts), 0)
+        self.assertIsNotNone(cols)
+
+
 if __name__ == "__main__":
     unittest.main()
+

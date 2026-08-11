@@ -68,7 +68,6 @@ def run_depth_inference(
     target_fps: int = config.VIDEO_TARGET_FPS,
     skip_preprocess: bool = False,
     npz_out: Path | None = None,
-    use_fp16: bool = config.DEPTH_USE_FP16,
     model_id: str = config.DEPTH_MODEL_ID,
 ) -> Path:
     video_path = Path(video_path)
@@ -146,14 +145,9 @@ def run_depth_inference(
     if not pil_images:
         sys.exit("[ERROR] Failed to extract any valid frames from video.")
 
-    fp16_str = " [FP16 autocast enabled]" if (use_fp16 and device == "cuda") else " [FP32]"
-    print(f"[+] Pass 1 — running Depth Anything V3 joint multi-view inference on {len(pil_images)} frames{fp16_str}...")
+    print(f"[+] Pass 1 — running Depth Anything V3 joint multi-view inference on {len(pil_images)} frames.")
     with torch.no_grad():
-        if use_fp16 and device == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                result = model.inference(pil_images)
-        else:
-            result = model.inference(pil_images)
+        result = model.inference(pil_images)
 
     raw_depths = result.depth
     raw_exts   = result.extrinsics
@@ -279,13 +273,11 @@ def generate_pcd_from_video(
     max_frames: int = 60,
     point_step: int = 4,
     return_depth_maps: bool = False,
-    use_fp16: bool = config.DEPTH_USE_FP16,
 ):
     npz_path = run_depth_inference(
         video_path,
         sample_stride=sample_stride,
         max_frames=max_frames,
-        use_fp16=use_fp16,
     )
 
     from pointcloud.pointcloud_builder import build_pointcloud_from_npz
@@ -306,7 +298,6 @@ if __name__ == "__main__":
     parser.add_argument("--res", "--target-long-edge", type=int, default=config.VIDEO_TARGET_LONG_EDGE, dest="res", help="Target long edge resolution in pixels (default from config)")
     parser.add_argument("--fps", "--target-fps", type=int, default=config.VIDEO_TARGET_FPS, dest="fps", help="Target video FPS (default from config)")
     parser.add_argument("--skip-preprocess", action="store_true", help="Skip video normalization and feed raw video directly to DA3")
-    parser.add_argument("--fp16", action="store_true", default=config.DEPTH_USE_FP16, help="Run inference in FP16 mixed precision")
     parser.add_argument("--model-id", type=str, default=config.DEPTH_MODEL_ID, help="HuggingFace model ID or local weights path for Depth Anything V3")
     args = parser.parse_args()
 
@@ -320,6 +311,5 @@ if __name__ == "__main__":
         target_fps=args.fps,
         skip_preprocess=args.skip_preprocess,
         npz_out=_npz_out,
-        use_fp16=args.fp16,
         model_id=args.model_id,
     )

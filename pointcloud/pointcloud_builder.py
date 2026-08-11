@@ -19,6 +19,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import config
+from pointcloud.filters import (
+    edge_filter_depth_map,
+    grazing_angle_filter_depth_map,
+    free_space_violation_filter,
+    tsdf_fuse,
+)
+
 
 DEFAULT_NPZ_PATH = config.PROCESSED_DATA_DIR / "raw_depths.npz"
 
@@ -129,11 +136,26 @@ def build_pointcloud_from_npz(
     conf_percentile: float = 0.0,
     sor_neighbors: int = 20,
     sor_std_ratio: float = 2.0,
-    ror_radius: float = 0.0,
-    ror_min_neighbors: int = 0,
-    dbscan_eps: float = 0.0,
-    dbscan_min_samples: int = 10,
-    dbscan_min_cluster_size: int = 50,
+    enable_ror: bool = config.ENABLE_ROR,
+    ror_radius: float = config.ROR_RADIUS,
+    ror_min_neighbors: int = config.ROR_MIN_NEIGHBORS,
+
+    enable_dbscan: bool = config.ENABLE_DBSCAN,
+    dbscan_eps: float = config.DBSCAN_EPS,
+    dbscan_min_samples: int = config.DBSCAN_MIN_SAMPLES,
+    dbscan_min_cluster_size: int = config.DBSCAN_MIN_CLUSTER_SIZE,
+
+    enable_edge_filter: bool = config.ENABLE_EDGE_FILTER,
+    edge_filter_alpha: float = config.EDGE_FILTER_ALPHA,
+    edge_dilate_iters: int = config.EDGE_DILATE_ITERS,
+    enable_grazing_filter: bool = config.ENABLE_GRAZING_FILTER,
+    grazing_max_angle_deg: float = config.GRAZING_MAX_ANGLE_DEG,
+    use_tsdf: bool = config.USE_TSDF,
+    tsdf_sdf_trunc: float | None = config.TSDF_SDF_TRUNC,
+    enable_free_space_check: bool = config.ENABLE_FREE_SPACE_CHECK,
+
+    fsv_margin: float = config.FSV_MARGIN,
+    fsv_violation_ratio: float = config.FSV_VIOLATION_RATIO,
     no_clean: bool = False,
     out_ply: Path | str | None = None,
 ):
@@ -186,32 +208,42 @@ def build_pointcloud_from_npz(
     has_colors          = len(rgb_keys) == n_frames
 
     print("[+] Processing depth maps...")
-    global_min  = float(min(d.min() for d in raw_depths))
-    global_max  = float(max(d.max() for d in raw_depths))
-    depth_range = (global_max - global_min) if global_max > global_min else 1.0
-    metric_span = depth_metric_max - depth_metric_min
-
-    def _to_metric(raw: np.ndarray) -> np.ndarray:
-        normalised = (raw - global_min) / depth_range
-        return depth_metric_min + normalised * metric_span
-
-    print("[+] Back-projecting 3-D points with predicted camera poses & colors...")
     depth_maps_out: dict   = {}
     all_world_points: list = []
     all_colors: list       = []
     frames_metadata_out: list = []
+    frames_info: list      = []
 
     for i in range(n_frames):
         frame_idx = frame_indices[i]
         depth_map = raw_depths[i].astype(np.float64)
-        depth_maps_out[frame_idx] = depth_map
 
+        # Edge-Aware Depth Map Filtering
+        if enable_edge_filter and edge_filter_alpha > 0:
+            depth_map = edge_filter_depth_map(
+                depth_map,
+                alpha=edge_filter_alpha,
+                dilate_iters=edge_dilate_iters,
+            )
+
+        depth_maps_out[frame_idx] = depth_map
         H, W = depth_map.shape
 
         if has_predicted_poses and f"ixt_{frame_idx}" in npz:
             K_i = npz[f"ixt_{frame_idx}"].astype(np.float64)
         else:
             K_i = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+
+        # Grazing-Angle Depth Map Filtering
+        if enable_grazing_filter and grazing_max_angle_deg < 90.0:
+            depth_map = grazing_angle_filter_depth_map(
+                depth_map,
+                K=K_i,
+                max_angle_deg=grazing_max_angle_deg,
+            )
+
+        depth_maps_out[frame_idx] = depth_map
+
 
         if has_predicted_poses and f"ext_{frame_idx}" in npz:
             ext_w2c = npz[f"ext_{frame_idx}"].astype(np.float64)
@@ -227,6 +259,9 @@ def build_pointcloud_from_npz(
             pose = np.array(frames_meta[i]["pose_matrix"]) if i < len(frames_meta) else np.eye(4)
             c2w = pose
 
+        rgb_map = npz[f"rgb_{frame_idx}"] if (has_colors and f"rgb_{frame_idx}" in npz) else None
+        frames_info.append({"depth": depth_map, "rgb": rgb_map, "c2w": c2w, "K": K_i})
+
         f_meta = dict(frames_meta[i]) if i < len(frames_meta) else {}
         f_dict = {
             "index": int(frame_idx),
@@ -239,69 +274,89 @@ def build_pointcloud_from_npz(
             "h": int(H),
         }
         f_meta.update(f_dict)
-        frames_metadata_out.append(f_meta)
+        frames_metadata_out.append(f_dict)
 
-        us = np.arange(0, W, point_step)
-        vs = np.arange(0, H, point_step)
-        uu, vv = np.meshgrid(us, vs)
+        if not use_tsdf or no_clean:
+            us = np.arange(0, W, point_step)
+            vs = np.arange(0, H, point_step)
+            uu, vv = np.meshgrid(us, vs)
 
-        d_vals = depth_map[vv, uu].ravel()
-        valid = np.isfinite(d_vals) & (d_vals > 0)
+            d_vals = depth_map[vv, uu].ravel()
+            valid = np.isfinite(d_vals) & (d_vals > 0)
 
-        if len(conf_keys) == n_frames and conf_percentile > 0 and f"conf_{frame_idx}" in npz:
-            conf_map = npz[f"conf_{frame_idx}"]
-            conf_vals = conf_map[vv, uu].ravel()
-            conf_thr = np.percentile(conf_vals, float(conf_percentile))
-            valid &= (conf_vals >= conf_thr)
+            if len(conf_keys) == n_frames and conf_percentile > 0 and f"conf_{frame_idx}" in npz:
+                conf_map = npz[f"conf_{frame_idx}"]
+                conf_vals = conf_map[vv, uu].ravel()
+                conf_thr = np.percentile(conf_vals, float(conf_percentile))
+                valid &= (conf_vals >= conf_thr)
 
-        if not np.any(valid):
-            continue
+            if np.any(valid):
+                uu_v = uu.ravel()[valid]
+                vv_v = vv.ravel()[valid]
+                d_v  = d_vals[valid]
 
-        uu_v = uu.ravel()[valid]
-        vv_v = vv.ravel()[valid]
-        d_v  = d_vals[valid]
+                pix = np.stack([uu_v, vv_v, np.ones_like(uu_v)], axis=-1)
+                K_inv = np.linalg.pinv(K_i)
+                rays = (K_inv @ pix.T)
 
-        pix = np.stack([uu_v, vv_v, np.ones_like(uu_v)], axis=-1)
-        K_inv = np.linalg.pinv(K_i)
-        rays = (K_inv @ pix.T)
+                Xc = rays * d_v[None, :]
+                Xc_h = np.vstack([Xc, np.ones((1, Xc.shape[1]))])
 
-        Xc = rays * d_v[None, :]
-        Xc_h = np.vstack([Xc, np.ones((1, Xc.shape[1]))])
+                if has_predicted_poses and f"ext_{frame_idx}" in npz:
+                    Xw = (c2w @ Xc_h)[:3].T
+                else:
+                    pts_cam_arkit = Xc.T.copy()
+                    pts_cam_arkit[:, 2] *= -1
+                    pts_cam_arkit[:, 1] *= -1
+                    pts_homo = np.hstack([pts_cam_arkit, np.ones((len(pts_cam_arkit), 1))])
+                    Xw = (c2w @ pts_homo.T).T[:, :3]
 
-        if has_predicted_poses and f"ext_{frame_idx}" in npz:
-            Xw = (c2w @ Xc_h)[:3].T
+                all_world_points.append(Xw)
+
+                if rgb_map is not None:
+                    if rgb_map.shape[:2] != (H, W):
+                        rgb_map = cv2.resize(rgb_map, (W, H))
+                    colors_v = rgb_map[vv_v, uu_v]
+                    all_colors.append(colors_v)
+
+    # Point Cloud Fusion: Open3D TSDF Fusion vs. Centroid Voxel Downsampling
+    if use_tsdf and not no_clean:
+        if tsdf_sdf_trunc is None or tsdf_sdf_trunc < (voxel_size * 1.5):
+            tsdf_sdf_trunc = voxel_size * 2.5
+        print(f"[+] Running Open3D TSDF Volumetric Fusion (voxel={voxel_size}m, sdf_trunc={tsdf_sdf_trunc}m, ratio={tsdf_sdf_trunc/voxel_size:.1f}x)...")
+        pts_clean, cols_clean = tsdf_fuse(
+            frames_info,
+            voxel_length=voxel_size,
+            sdf_trunc=tsdf_sdf_trunc,
+            depth_max=depth_metric_max,
+        )
+
+    else:
+        if not all_world_points:
+            sys.exit("[ERROR] Failed to back-project any 3-D points.")
+        pts_concat = np.vstack(all_world_points).astype(np.float64)
+        print(f"[+] Total raw 3-D points back-projected: {len(pts_concat):,}")
+        cols_concat = np.vstack(all_colors).astype(np.uint8) if all_colors else None
+
+        if no_clean:
+            pts_clean = pts_concat
+            cols_clean = cols_concat
         else:
-            pts_cam_arkit = Xc.T.copy()
-            pts_cam_arkit[:, 2] *= -1
-            pts_cam_arkit[:, 1] *= -1
-            pts_homo = np.hstack([pts_cam_arkit, np.ones((len(pts_cam_arkit), 1))])
-            Xw = (c2w @ pts_homo.T).T[:, :3]
+            pts_clean, cols_clean = _voxel_downsample_centroid(pts_concat, cols_concat, voxel_size=voxel_size)
 
-        all_world_points.append(Xw)
+    # Multi-View Free-Space Consistency Check
+    if enable_free_space_check and fsv_margin > 0 and not no_clean and len(pts_clean) > 0:
+        print(f"[+] Applying Multi-View Free-Space Consistency Check (margin={fsv_margin}m, ratio={fsv_violation_ratio})...")
+        pts_clean, cols_clean = free_space_violation_filter(
+            pts_clean,
+            cols_clean,
+            frames_info,
+            margin=fsv_margin,
+            violation_ratio=fsv_violation_ratio,
+        )
 
-        if has_colors and f"rgb_{frame_idx}" in npz:
-            rgb_map = npz[f"rgb_{frame_idx}"]
-            if rgb_map.shape[:2] != (H, W):
-                rgb_map = cv2.resize(rgb_map, (W, H))
-            colors_v = rgb_map[vv_v, uu_v]
-            all_colors.append(colors_v)
-
-    if not all_world_points:
-        sys.exit("[ERROR] Failed to back-project any 3-D points.")
-
-    pts_concat = np.vstack(all_world_points).astype(np.float64)
-    print(f"[+] Total raw 3-D points back-projected: {len(pts_concat):,}")
-
-    if all_colors:
-        cols_concat = np.vstack(all_colors).astype(np.uint8)
-    else:
-        cols_concat = None
-
-    if no_clean:
-        pts_clean = pts_concat
-        cols_clean = cols_concat
-    else:
-        pts_clean, cols_clean = _voxel_downsample_centroid(pts_concat, cols_concat, voxel_size=voxel_size)
+    # Post-filtering cleanup passes
+    if not no_clean:
         if sor_neighbors > 0 and sor_std_ratio > 0:
             n_before = len(pts_clean)
             print(f"[+] Applying Statistical Outlier Removal (k={sor_neighbors}, std_ratio={sor_std_ratio})...")
@@ -309,14 +364,15 @@ def build_pointcloud_from_npz(
                 pts_clean, cols_clean, nb_neighbors=sor_neighbors, std_ratio=sor_std_ratio
             )
             print(f"    Removed {n_before - len(pts_clean):,} points.")
-        if ror_radius > 0 and ror_min_neighbors > 0:
+        if enable_ror and ror_radius > 0 and ror_min_neighbors > 0:
             n_before = len(pts_clean)
             print(f"[+] Applying Radius Outlier Removal (radius={ror_radius}, min_neighbors={ror_min_neighbors})...")
             pts_clean, cols_clean = _radius_outlier_removal(
                 pts_clean, cols_clean, radius=ror_radius, min_neighbors=ror_min_neighbors
             )
             print(f"    Removed {n_before - len(pts_clean):,} points.")
-        if dbscan_eps > 0:
+
+        if enable_dbscan and dbscan_eps > 0:
             n_before = len(pts_clean)
             print(f"[+] Applying DBSCAN Cluster Outlier Removal (eps={dbscan_eps}, min_samples={dbscan_min_samples}, min_cluster_size={dbscan_min_cluster_size})...")
             pts_clean, cols_clean = _cluster_outlier_removal(
@@ -326,6 +382,7 @@ def build_pointcloud_from_npz(
                 min_cluster_size=dbscan_min_cluster_size,
             )
             print(f"    Removed {n_before - len(pts_clean):,} points.")
+
 
     print(f"[+] Points after cleaning: {len(pts_clean):,}")
 
@@ -381,11 +438,30 @@ if __name__ == "__main__":
     parser.add_argument("--conf-percentile", type=float, default=0.0, help="Confidence percentile threshold (default: 0.0 = no clipping, 30.0 = drop bottom 30%%)")
     parser.add_argument("--sor-neighbors", type=int, default=20, help="Statistical outlier removal number of neighbors (default: 20)")
     parser.add_argument("--sor-std-ratio", type=float, default=2.0, help="Statistical outlier removal standard deviation ratio (default: 2.0)")
-    parser.add_argument("--ror-radius", type=float, default=config.ROR_RADIUS, help="Radius outlier removal search radius in meters (default: from config)")
-    parser.add_argument("--ror-min-neighbors", type=int, default=config.ROR_MIN_NEIGHBORS, help="Radius outlier removal minimum neighbors inside radius (default: from config)")
-    parser.add_argument("--dbscan-eps", type=float, default=0.0, help="DBSCAN cluster outlier removal epsilon radius in meters (default: 0 = disabled)")
-    parser.add_argument("--dbscan-min-samples", type=int, default=10, help="DBSCAN minimum samples to form a core point (default: 10)")
-    parser.add_argument("--dbscan-min-cluster-size", type=int, default=50, help="DBSCAN minimum cluster size to keep (default: 50)")
+    parser.add_argument("--ror", "--radius-removal", action=argparse.BooleanOptionalAction, default=config.ENABLE_ROR, help="Enable/disable Radius Outlier Removal (ROR)")
+    parser.add_argument("--ror-radius", type=float, default=config.ROR_RADIUS, help="Radius Outlier Removal search radius in meters (default: 0.05)")
+    parser.add_argument("--ror-min-neighbors", type=int, default=config.ROR_MIN_NEIGHBORS, help="Radius Outlier Removal minimum neighbors inside radius (default: 5)")
+
+    parser.add_argument("--dbscan", action=argparse.BooleanOptionalAction, default=config.ENABLE_DBSCAN, help="Enable/disable DBSCAN cluster outlier removal")
+    parser.add_argument("--dbscan-eps", type=float, default=config.DBSCAN_EPS, help="DBSCAN cluster outlier removal epsilon radius in meters (default: 0.05)")
+    parser.add_argument("--dbscan-min-samples", type=int, default=config.DBSCAN_MIN_SAMPLES, help="DBSCAN minimum samples to form a core point (default: 10)")
+    parser.add_argument("--dbscan-min-cluster-size", type=int, default=config.DBSCAN_MIN_CLUSTER_SIZE, help="DBSCAN minimum cluster size to keep (default: 50)")
+
+    parser.add_argument("--edge-filter", action=argparse.BooleanOptionalAction, default=config.ENABLE_EDGE_FILTER, help="Enable/disable edge-aware depth map filtering")
+    parser.add_argument("--edge-alpha", type=float, default=config.EDGE_FILTER_ALPHA, help="Edge-aware depth map filter alpha threshold (default: 0.05)")
+    parser.add_argument("--edge-dilate-iters", type=int, default=config.EDGE_DILATE_ITERS, help="Edge-aware depth map filter dilation iterations (default: 1)")
+
+    parser.add_argument("--grazing-filter", action=argparse.BooleanOptionalAction, default=config.ENABLE_GRAZING_FILTER, help="Enable/disable grazing-angle depth map filtering")
+    parser.add_argument("--grazing-max-angle", type=float, default=config.GRAZING_MAX_ANGLE_DEG, help="Grazing-angle filter max viewing angle in degrees (default: 75.0)")
+
+    parser.add_argument("--tsdf", action=argparse.BooleanOptionalAction, default=config.ENABLE_TSDF_FUSION, help="Enable/disable Open3D TSDF Volumetric Fusion")
+    parser.add_argument("--tsdf-sdf-trunc", type=float, default=config.TSDF_SDF_TRUNC, help="TSDF SDF truncation distance in meters (default: 0.05)")
+
+    parser.add_argument("--free-space-check", "--fsv", action=argparse.BooleanOptionalAction, default=config.ENABLE_FREE_SPACE_CHECK, help="Enable/disable multi-view free-space consistency check")
+    parser.add_argument("--fsv-margin", type=float, default=config.FSV_MARGIN, help="Free-space violation depth margin in meters (default: 0.06)")
+    parser.add_argument("--fsv-violation-ratio", type=float, default=config.FSV_VIOLATION_RATIO, help="Free-space violation ratio threshold (default: 0.20)")
+
+
     parser.add_argument("--no-clean", action="store_true", help="Skip voxel downsampling and save raw unmerged points")
     parser.add_argument("--out", "--output", type=str, default=None, dest="out", help="Custom output .ply path")
     args = parser.parse_args()
@@ -398,11 +474,27 @@ if __name__ == "__main__":
         conf_percentile=args.conf_percentile,
         sor_neighbors=args.sor_neighbors,
         sor_std_ratio=args.sor_std_ratio,
+        enable_ror=args.ror,
         ror_radius=args.ror_radius,
         ror_min_neighbors=args.ror_min_neighbors,
+        enable_dbscan=args.dbscan,
         dbscan_eps=args.dbscan_eps,
         dbscan_min_samples=args.dbscan_min_samples,
         dbscan_min_cluster_size=args.dbscan_min_cluster_size,
+        enable_edge_filter=args.edge_filter,
+        edge_filter_alpha=args.edge_alpha,
+        edge_dilate_iters=args.edge_dilate_iters,
+        enable_grazing_filter=args.grazing_filter,
+        grazing_max_angle_deg=args.grazing_max_angle,
+        use_tsdf=args.tsdf,
+        tsdf_sdf_trunc=args.tsdf_sdf_trunc,
+        enable_free_space_check=args.free_space_check,
+        fsv_margin=args.fsv_margin,
+        fsv_violation_ratio=args.fsv_violation_ratio,
         no_clean=args.no_clean,
         out_ply=args.out,
     )
+
+
+
+

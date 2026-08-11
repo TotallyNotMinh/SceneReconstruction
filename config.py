@@ -24,32 +24,39 @@ YOLO_MODEL_PATH    = WEIGHTS_DIR / "yolo11m-seg.pt"
 SAM_CHECKPOINT_PATH = WEIGHTS_DIR / "mobile_sam.pt"
 
 # ── Point-cloud Processing ───────────────────────────────────────────────────
-VOXEL_SIZE_PCD     = 0.01      # Voxel grid cell size (m)
+VOXEL_SIZE_PCD     = 0.005      # Voxel grid cell size (m)
 DEPTH_METRIC_MIN   = 0.5       # Near clamp for metric depth (m)
 DEPTH_METRIC_MAX   = 5.0       # Far clamp for metric depth (m)
+ENABLE_ROR         = False     # Enable Radius Outlier Removal by default
 ROR_RADIUS         = 0.05      # Radius Outlier Removal search radius (m)
 ROR_MIN_NEIGHBORS  = 5         # Radius Outlier Removal min neighbors inside radius
 
+
+# ── Multi-View Artifact Reduction & TSDF Fusion ──────────────────────────────
+ENABLE_EDGE_FILTER     = False  # Enable edge-aware depth map filtering before back-projection
+EDGE_FILTER_ALPHA      = 0.05  # Relative gradient threshold for silhouette depth filtering
+EDGE_DILATE_ITERS      = 1     # Dilation iterations for edge depth mask
+
+ENABLE_GRAZING_FILTER  = False  # Invalidate depth pixels observed at steep grazing angles
+GRAZING_MAX_ANGLE_DEG  = 30  # Max viewing angle from surface normal in degrees
+
+ENABLE_TSDF_FUSION     = True  # Use Open3D TSDF Volumetric Fusion
+USE_TSDF               = ENABLE_TSDF_FUSION  # Alias for ENABLE_TSDF_FUSION
+TSDF_SDF_TRUNC         = VOXEL_SIZE_PCD * 2.5 # TSDF SDF truncation distance (m) (2.5x voxel size)
+
+ENABLE_FREE_SPACE_CHECK = False  # Enable multi-view free-space consistency check
+FSV_MARGIN             = 0.06  # Free-space violation depth margin (m)
+FSV_VIOLATION_RATIO    = 0.20  # Ratio threshold for free-space violation filter
+
+
+
 # ── ObjectEstimator: Back-projection & Clustering ────────────────────────────
+ENABLE_DBSCAN           = False # Enable DBSCAN cluster outlier removal
 DBSCAN_EPS              = 0.05  # DBSCAN neighbourhood radius (m)
 DBSCAN_MIN_SAMPLES      = 10    # Minimum points to form a cluster
+DBSCAN_MIN_CLUSTER_SIZE = 50    # Minimum cluster size to keep
 OCCLUSION_MIN_CONSENSUS = 0.60  # Fraction of views a point must be visible in
 
-# ── MeshPlacer ───────────────────────────────────────────────────────────────
-MAX_DISTORTION_THRESH   = 1.25  # Max anisotropic scale ratio before non-uniform scale
-
-# ── RoomBuilder: RANSAC Plane Detection ──────────────────────────────────────
-RANSAC_DISTANCE_THRESH  = 0.03  # Inlier distance from plane (m)
-RANSAC_ITERATIONS       = 500   # RANSAC iteration budget
-RANSAC_MIN_INLIERS      = 20    # Minimum inliers to accept a plane
-FLOOR_NORMAL_THRESH     = 0.80  # |B| threshold for horizontal plane (Y-normal)
-TABLE_MIN_HEIGHT        = 0.35  # Min height above floor to be a table surface (m)
-TABLE_MAX_HEIGHT        = 1.30  # Max height above floor to be a table surface (m)
-TABLE_SNAP_TOLERANCE    = 0.35  # Vertical distance to snap object onto a table (m)
-
-# ── Alpha Shape Meshing ───────────────────────────────────────────────────────
-ALPHA_SHAPE_ALPHA   = 0.10      # Tightness of alpha shape (m)
-ALPHA_MAX_FACES     = 5_000     # Quadric-decimate threshold if face count exceeds this
 
 # ── Video Normalizer ─────────────────────────────────────────────────────────
 VIDEO_TARGET_LONG_EDGE = 720    # Resize so the longer edge is this many pixels
@@ -59,13 +66,4 @@ VIDEO_TARGET_FPS       = 24     # Cap output frame rate (clamped to source FPS)
 DEPTH_MODEL_ID      = "depth-anything/da3-base"  # HuggingFace model repo ID
 DEPTH_SAMPLE_STRIDE = 8    # Sample 1 frame every N frames for DA3 inference
 DEPTH_MAX_FRAMES    = 60   # Max frames fed to DA3 joint inference (VRAM bound)
-DEPTH_USE_FP16      = True   # Run inference in FP16 mixed precision by default
 
-# ── ReID & Object Detection ──────────────────────────────────────────────────
-SIMILARITY_THRESHOLD  = 0.8     # DINOv2 Cosine similarity threshold for object Re-ID
-SAMPLE_EVERY_N_FRAMES = 5       # Sample 1 every 5 frames for Re-ID feature extraction
-MIN_CROP_SIZE         = 100     # Minimum px size to ignore noise
-
-TARGET_CLASSES = {
-    'chair', 'couch', 'tv', 'microwave', 'oven', 'refrigerator', 'dining table'
-}
