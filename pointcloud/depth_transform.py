@@ -23,20 +23,27 @@ def extract_timestamp(path: Path) -> float:
             f"Không parse được timestamp từ tên file: '{path.name}'. "
             f"Kỳ vọng dạng 'sessionID_timestamp.png'."
         )
-def remove_flying_pixels(depth: np.ndarray, threshold: float = 0.05, kernel_size: int = 3) -> np.ndarray:
+def remove_flying_pixels(depth: np.ndarray, rel_threshold: float = 0.15, median_ksize: int = 5) -> np.ndarray:
+        valid_mask = depth > 0
+    depth_for_median = depth.copy()
+    depth_for_median[~valid_mask] = 0
+
+    # median blur cần input uint8/uint16/float32, ksize lẻ
+    local_median = cv2.medianBlur(depth_for_median.astype(np.float32), median_ksize)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel_diff = np.abs(depth - local_median) / np.maximum(local_median, 1e-6)
+
+    edge_mask = (rel_diff > rel_threshold) & valid_mask
     depth_clean = depth.copy()
-
-    # tính gradient theo 2 hướng
-    grad_x = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=kernel_size)
-    grad_y = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=kernel_size)
-    grad_mag = np.sqrt(grad_x**2 + grad_y**2)
-
-    edge_mask = grad_mag > threshold
     depth_clean[edge_mask] = 0.0
-
     return depth_clean
+
+import json
+
 def process_to_single_npz(INPUT_DIR: Path = PROJECT_ROOT / "highres_depth"):
     OUTPUT_FILE = config.PROCESSED_DATA_DIR / "raw_depths.npz"
+    DEBUG_FILE = config.PROCESSED_DATA_DIR / "depth_debug_stats.json"
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     image_files = sorted(INPUT_DIR.glob("*.png"), key=extract_timestamp)
@@ -49,7 +56,8 @@ def process_to_single_npz(INPUT_DIR: Path = PROJECT_ROOT / "highres_depth"):
     data_to_save = {}
     file_names = []
     ref_shape = None
-    index = 0  # index thực tế được gán, chỉ tăng khi đọc file thành công
+    index = 0
+    debug_stats = []  # lưu thống kê từng frame để xem lại sau
 
     for img_path in image_files:
         depth_map = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
@@ -58,26 +66,44 @@ def process_to_single_npz(INPUT_DIR: Path = PROJECT_ROOT / "highres_depth"):
             continue
 
         depth_array = np.asarray(depth_map, dtype=np.float32)
-        depth_array = remove_flying_pixels(depth_array, threshold=0.05)
+
         if ref_shape is None:
             ref_shape = depth_array.shape
         elif depth_array.shape != ref_shape:
-            print(
-                f"  [CẢNH BÁO] {img_path.name} có shape {depth_array.shape}, "
-                f"khác shape tham chiếu {ref_shape} -> bỏ qua file này."
-            )
+            print(f"  [CẢNH BÁO] {img_path.name} shape lệch -> bỏ qua")
             continue
 
-        data_to_save[f"depth_{index}"] = depth_array
+        # thống kê TRƯỚC khi lọc, để biết rõ scale/đơn vị thật sự
+        valid = depth_array[depth_array > 0]
+        stats_before = {
+            "file": img_path.name,
+            "dtype_goc": str(depth_map.dtype),
+            "min": float(valid.min()) if valid.size else None,
+            "max": float(valid.max()) if valid.size else None,
+            "mean": float(valid.mean()) if valid.size else None,
+            "n_valid_px": int(valid.size),
+        }
+
+        depth_clean = remove_flying_pixels(depth_array, rel_threshold=0.15)
+
+        n_valid_after = int((depth_clean > 0).sum())
+        stats_before["n_valid_px_after_filter"] = n_valid_after
+        stats_before["ty_le_giu_lai"] = round(n_valid_after / max(valid.size, 1), 3)
+        debug_stats.append(stats_before)
+
+        data_to_save[f"depth_{index}"] = depth_clean
         file_names.append(img_path.name)
-        print(f"  -> Đã đọc: {img_path.name} (t={extract_timestamp(img_path):.3f}s, lưu thành depth_{index})")
         index += 1
 
     if data_to_save:
         data_to_save["filenames"] = np.asarray(file_names)
         np.savez_compressed(OUTPUT_FILE, **data_to_save)
-        print(f"\n[THÀNH CÔNG] Đã lưu {len(file_names)} mảng depth riêng biệt vào:")
-        print(f"  {OUTPUT_FILE}")
+
+        with open(DEBUG_FILE, "w") as f:
+            json.dump(debug_stats, f, indent=2)
+
+        print(f"\n[THÀNH CÔNG] Đã lưu {len(file_names)} depth map vào {OUTPUT_FILE}")
+        print(f"[DEBUG] Thống kê chi tiết từng frame: {DEBUG_FILE}")
     else:
         print("[LỖI] Không có depth map hợp lệ nào để lưu.")
 
