@@ -113,7 +113,7 @@ def render_side_by_side(video_path: Path, output_path: Path, sample_stride: int 
 
         stacked_frame = np.hstack([frame_bgr, depth_color_bgr])
 
-        progress_pct = (frame_idx / total_frames) * 100.0
+        progress_pct = (frame_idx / max(1, total_frames)) * 100.0
         hud_text = f" Frame: {frame_idx}/{total_frames} ({progress_pct:.1f}%) | Model: Depth-Anything-V2-Base-hf "
         cv2.rectangle(stacked_frame, (0, out_h - 30), (out_w, out_h), (20, 20, 20), -1)
         cv2.putText(stacked_frame, hud_text, (20, out_h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)

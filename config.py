@@ -57,7 +57,7 @@ VIDEO_TARGET_FPS       = 24     # Cap output frame rate (clamped to source FPS)
 DEPTH_MODEL_ID      = "depth-anything/da3-base"  # HuggingFace model repo ID
 DEPTH_SAMPLE_STRIDE = 8    # Sample 1 frame every N frames for DA3 inference
 DEPTH_MAX_FRAMES    = 60   # Max frames fed to DA3 joint inference (VRAM bound)
-DEPTH_USE_FP16      = False  # Run inference in FP16 mixed precision (needed for Turing/T4 GPUs)
+DEPTH_USE_FP16      = True   # Run inference in FP16 mixed precision by default
 
 # ── ReID & Object Detection ──────────────────────────────────────────────────
 SIMILARITY_THRESHOLD  = 0.8     # DINOv2 Cosine similarity threshold for object Re-ID

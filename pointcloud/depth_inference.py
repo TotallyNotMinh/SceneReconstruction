@@ -50,12 +50,11 @@ def preprocess_video(
     return res["processed_video_path"], res
 
 
-def load_depth_anything_model(device=None):
+def load_depth_anything_model(model_id: str = config.DEPTH_MODEL_ID, device=None):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model_id = config.DEPTH_MODEL_ID
-    print(f"[+] Loading Depth Anything V3 Base model ({model_id}) on {device}...")
+    print(f"[+] Loading Depth Anything V3 model ({model_id}) on {device}...")
     model = DepthAnything3.from_pretrained(model_id).to(device)
     model.eval()
     return model, device
@@ -65,8 +64,12 @@ def run_depth_inference(
     video_path: Path,
     sample_stride: int = config.DEPTH_SAMPLE_STRIDE,
     max_frames: int = config.DEPTH_MAX_FRAMES,
+    target_long_edge: int = config.VIDEO_TARGET_LONG_EDGE,
+    target_fps: int = config.VIDEO_TARGET_FPS,
+    skip_preprocess: bool = False,
     npz_out: Path | None = None,
     use_fp16: bool = config.DEPTH_USE_FP16,
+    model_id: str = config.DEPTH_MODEL_ID,
 ) -> Path:
     video_path = Path(video_path)
     if not video_path.exists():
@@ -77,14 +80,22 @@ def run_depth_inference(
 
     preprocessed_path: Path | None = None
     prep_meta: dict = {}
-    try:
-        preprocessed_path, prep_meta = preprocess_video(video_path)
-        working_path = preprocessed_path
-    except RuntimeError as exc:
-        print(f"[WARNING] Video preprocessing failed — using original video.\n  {exc}")
+    if not skip_preprocess:
+        try:
+            preprocessed_path, prep_meta = preprocess_video(
+                video_path,
+                target_long_edge=target_long_edge,
+                target_fps=target_fps,
+            )
+            working_path = preprocessed_path
+        except RuntimeError as exc:
+            print(f"[WARNING] Video preprocessing failed — using original video.\n  {exc}")
+            working_path = video_path
+    else:
+        print(f"[+] Skipping video preprocessing — using raw input video: {video_path.name}")
         working_path = video_path
 
-    model, device = load_depth_anything_model()
+    model, device = load_depth_anything_model(model_id=model_id)
 
     cap = cv2.VideoCapture(str(working_path))
     if not cap.isOpened():
@@ -103,9 +114,14 @@ def run_depth_inference(
     scale_y = prep_meta.get("scale_y", 1.0)
 
     intrinsics = np.array(rescaled_intrinsics, dtype=np.float64)
-    sampled_indices = list(range(0, total_frames, sample_stride))[:max_frames]
+    if total_frames <= max_frames:
+        sampled_indices = list(range(0, total_frames, max(1, sample_stride)))
+    else:
+        # Uniformly distribute max_frames across the ENTIRE duration of the video (from 0% to 100%)
+        sampled_indices = np.linspace(0, total_frames - 1, num=max_frames, dtype=int).tolist()
+        sampled_indices = sorted(list(dict.fromkeys(sampled_indices)))
 
-    print(f"[+] Decoding {len(sampled_indices)} frames for multi-view DA3 inference...")
+    print(f"[+] Decoding {len(sampled_indices)} frames uniformly across full video (span: frames {sampled_indices[0]}..{sampled_indices[-1]} of {total_frames})...")
     pil_images = []
     rgb_frames = []
     valid_indices = []
@@ -152,7 +168,7 @@ def run_depth_inference(
             e = raw_exts[idx]
             ext_mat[:e.shape[0], :e.shape[1]] = e
 
-        video_frame_id = sampled_indices[idx]
+        video_frame_id = sampled_indices[i]
         frame_dict = {
             "index": int(i),
             "video_frame_index": int(video_frame_id),
@@ -282,12 +298,28 @@ def generate_pcd_from_video(
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Depth Anything V3 Multi-View Inference")
+    parser = argparse.ArgumentParser(description="Depth Anything V3 Multi-View Joint Inference (Pass 1)")
     parser.add_argument("video", type=str, help="Path to input video file")
     parser.add_argument("npz_out", type=str, nargs="?", default=None, help="Path to output NPZ file (optional)")
+    parser.add_argument("--max-frames", type=int, default=config.DEPTH_MAX_FRAMES, help="Max frames for joint multi-view inference (default from config)")
+    parser.add_argument("--stride", "--sample-stride", type=int, default=config.DEPTH_SAMPLE_STRIDE, dest="stride", help="Frame sampling stride (default from config)")
+    parser.add_argument("--res", "--target-long-edge", type=int, default=config.VIDEO_TARGET_LONG_EDGE, dest="res", help="Target long edge resolution in pixels (default from config)")
+    parser.add_argument("--fps", "--target-fps", type=int, default=config.VIDEO_TARGET_FPS, dest="fps", help="Target video FPS (default from config)")
+    parser.add_argument("--skip-preprocess", action="store_true", help="Skip video normalization and feed raw video directly to DA3")
     parser.add_argument("--fp16", action="store_true", default=config.DEPTH_USE_FP16, help="Run inference in FP16 mixed precision")
+    parser.add_argument("--model-id", type=str, default=config.DEPTH_MODEL_ID, help="HuggingFace model ID or local weights path for Depth Anything V3")
     args = parser.parse_args()
 
     _video = args.video
     _npz_out = Path(args.npz_out) if args.npz_out else None
-    run_depth_inference(_video, npz_out=_npz_out, use_fp16=args.fp16)
+    run_depth_inference(
+        _video,
+        sample_stride=args.stride,
+        max_frames=args.max_frames,
+        target_long_edge=args.res,
+        target_fps=args.fps,
+        skip_preprocess=args.skip_preprocess,
+        npz_out=_npz_out,
+        use_fp16=args.fp16,
+        model_id=args.model_id,
+    )
