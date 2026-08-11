@@ -109,4 +109,4 @@ def process_to_single_npz(INPUT_DIR: Path = PROJECT_ROOT / "highres_depth"):
 
 
 if __name__ == "__main__":
-    process_to_single_npz()
+    process_to_single_npz(INPUT_DIR = PROJECT_ROOT / "raw_depths")
