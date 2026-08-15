@@ -286,6 +286,10 @@ def process_object_detections(
 
                 if f"ext_{f_idx}" in npz:
                     w2c = npz[f"ext_{f_idx}"].astype(np.float64)
+                    if w2c.shape == (3, 4):
+                        H_mat = np.eye(4, dtype=np.float64)
+                        H_mat[:3, :4] = w2c
+                        w2c = H_mat
                     c2w = np.linalg.pinv(w2c)
                     c2w = np.diag([1.0, -1.0, -1.0, 1.0]) @ c2w
                 elif f_idx in frames_meta:

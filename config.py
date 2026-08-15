@@ -62,12 +62,17 @@ RANSAC_DISTANCE_THRESH      = 0.03   # Max inlier distance for RANSAC floor/tabl
 RANSAC_N                    = 3      # Number of points sampled per RANSAC plane hypothesis
 RANSAC_NUM_ITERATIONS       = 1000   # Number of RANSAC iterations
 ROOM_FLOOR_NORMAL_TOLERANCE = 0.85   # Min abs(dot(normal, gravity_up)) to qualify as horizontal plane
+ROOM_WALL_NORMAL_TOLERANCE  = 0.25   # Max abs(dot(normal, gravity_up)) to qualify as vertical wall plane
 
 # ── ObjectEstimator & 3D Surface Meshing ─────────────────────────────────────
 ALPHA_SHAPE_ALPHA           = 0.10   # Alpha-Shape concavity parameter for 3D mesh surface generation (m)
 
-# ── MeshPlacer & Surface Snapping ────────────────────────────────────────────
+# ── MeshPlacer & Surface / Wall Snapping ─────────────────────────────────────
 SURFACE_SNAPPING_MARGIN     = 0.00   # Vertical offset margin when snapping mesh bottom to surface (m)
+WALL_SNAPPING_MARGIN        = 0.01   # Margin offset when snapping mesh onto vertical wall surface (m)
+WALL_MOUNTED_CLASSES        = {      # Semantic labels for objects mounted on walls
+    "tv", "tvmonitor", "picture", "clock", "mirror", "whiteboard", "poster", "wall_art", "screen"
+}
 
 
 # ── Video Normalizer ─────────────────────────────────────────────────────────

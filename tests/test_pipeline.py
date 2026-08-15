@@ -282,9 +282,10 @@ class TestFilters(unittest.TestCase):
 
 
 from spatial.room_builder import detect_architectural_planes
-from spatial.object_estimator import backproject_mask_to_3d, filter_object_pointcloud_dbscan
-from spatial.mesh_placer import snap_mesh_to_surface
+from spatial.object_estimator import backproject_mask_to_3d, filter_object_pointcloud_dbscan, process_object_detections
+from spatial.mesh_placer import snap_mesh_to_surface, snap_mesh_to_wall, align_and_place_object_meshes
 import trimesh
+import json
 
 
 class TestSpatialPhase1RoomBuilder(unittest.TestCase):
@@ -298,13 +299,15 @@ class TestSpatialPhase1RoomBuilder(unittest.TestCase):
             result = detect_architectural_planes(
                 ply_path=ply_path,
                 distance_threshold=0.04,
-                max_planes=3,
+                max_planes=4,
                 out_obj=out_obj,
                 out_json=out_json,
             )
 
             self.assertIsNotNone(result["floor"])
             self.assertAlmostEqual(result["floor"]["mean_y"], 0.0, delta=0.1)
+            self.assertIn("walls", result)
+            self.assertTrue(len(result["walls"]) > 0)
             self.assertTrue(out_obj.exists())
             self.assertTrue(out_json.exists())
 
@@ -337,6 +340,40 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
         clean_pts, _ = filter_object_pointcloud_dbscan(pts, eps=0.1, min_samples=5, min_cluster_size=20)
         self.assertEqual(len(clean_pts), 100)
 
+    def test_process_object_detections_with_3x4_extrinsics(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            npz_path = Path(tmp_dir) / "raw_depths.npz"
+            det_path = Path(tmp_dir) / "detections.json"
+            out_dir = Path(tmp_dir) / "objects"
+
+            # Create mock depth and 3x4 extrinsics
+            depth_0 = np.ones((60, 60), dtype=np.float32) * 1.8
+            ixt_0 = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+            ext_0 = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], dtype=np.float64)  # (3, 4)
+            np.savez(str(npz_path), depth_0=depth_0, ixt_0=ixt_0, ext_0=ext_0)
+
+            det_data = {
+                "obj_1": {
+                    "label": "chair",
+                    "class_id": 56,
+                    "associated_views": [
+                        {"frame_index": 0, "bbox": [15, 15, 45, 45], "score": 0.95}
+                    ]
+                }
+            }
+            with open(det_path, "w", encoding="utf-8") as f:
+                json.dump(det_data, f)
+
+            # This must run without (4, 3) @ (4, N) shape mismatch exception
+            result = process_object_detections(
+                detections_path=det_path,
+                raw_depths_path=npz_path,
+                out_dir=out_dir
+            )
+            self.assertIn("obj_1", result)
+            self.assertGreater(result["obj_1"]["point_count"], 0)
+            self.assertTrue(Path(result["obj_1"]["mesh_path"]).exists())
+
 
 class TestSpatialPhase3MeshPlacer(unittest.TestCase):
 
@@ -362,6 +399,89 @@ class TestSpatialPhase3MeshPlacer(unittest.TestCase):
         self.assertIsInstance(snapped_mesh, trimesh.Trimesh)
         min_y_after = float(snapped_mesh.vertices[:, 1].min())
         self.assertAlmostEqual(min_y_after, 0.0, places=4)
+
+    def test_snap_mesh_to_wall(self):
+        # Create a TV mesh (thin box) hanging on a wall at Y = 1.5m, X = 0.0m, Z = -1.5m
+        tv_box = trimesh.creation.box(extents=[1.0, 0.6, 0.05])
+        tv_box.apply_translation([0.0, 1.5, -1.5])
+
+        wall_plane = {
+            "id": 1,
+            "equation": [0.0, 0.0, 1.0, 2.0],  # 0*x + 0*y + 1*z + 2.0 = 0 -> Wall at Z = -2.0
+            "normal": [0.0, 0.0, 1.0],
+            "min_bound": [-3.0, 0.0, -2.05],
+            "max_bound": [3.0, 3.0, -1.95],
+        }
+
+        snapped_tv, delta_trans = snap_mesh_to_wall(tv_box, wall_plane, margin=0.01)
+        verts_snapped = np.asarray(snapped_tv.vertices)
+
+        # 1. Height Y must be preserved exactly
+        self.assertAlmostEqual(delta_trans[1], 0.0, places=5)
+        self.assertAlmostEqual(float(verts_snapped[:, 1].mean()), 1.5, places=4)
+
+        # 2. Back of TV (min Z) must be shifted close to wall Z = -2.0 + margin 0.01 = -1.99
+        min_z_snapped = float(verts_snapped[:, 2].min())
+        self.assertAlmostEqual(min_z_snapped, -1.99, places=4)
+
+    def test_align_and_place_wall_mounted_object(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+            planes_json_path = Path(tmp_dir) / "detected_planes.json"
+            out_dir = Path(tmp_dir) / "objects_aligned"
+
+            # Create TV mesh
+            tv_mesh = trimesh.creation.box(extents=[1.0, 0.6, 0.05])
+            tv_mesh.apply_translation([0.0, 1.5, -1.5])
+            tv_mesh.export(str(objs_dir / "obj_1_tv.ply"))
+
+            # Create Chair mesh
+            chair_mesh = trimesh.creation.box(extents=[0.5, 0.8, 0.5])
+            chair_mesh.apply_translation([0.0, 0.8, 0.0])
+            chair_mesh.export(str(objs_dir / "obj_2_chair.ply"))
+
+            manifest_data = {
+                "obj_1_tv": {"label": "tv"},
+                "obj_2_chair": {"label": "chair"}
+            }
+            with open(objs_dir / "objects_manifest.json", "w", encoding="utf-8") as f:
+                json.dump(manifest_data, f)
+
+            planes_data = {
+                "floor": {"mean_y": 0.0, "min_bound": [-3, -0.05, -3], "max_bound": [3, 0.05, 3]},
+                "tables": [],
+                "walls": [
+                    {
+                        "id": 0,
+                        "equation": [0.0, 0.0, 1.0, 2.0],
+                        "normal": [0.0, 0.0, 1.0],
+                        "min_bound": [-3, 0, -2.05],
+                        "max_bound": [3, 3, -1.95],
+                    }
+                ]
+            }
+            with open(planes_json_path, "w", encoding="utf-8") as f:
+                json.dump(planes_data, f)
+
+            summary = align_and_place_object_meshes(
+                objects_dir=objs_dir,
+                plane_data_path=planes_json_path,
+                out_dir=out_dir
+            )
+
+            self.assertEqual(len(summary), 2)
+            summary_dict = {item["name"]: item for item in summary}
+
+            # TV must have placement_type == "wall", delta_y == 0.0
+            tv_item = summary_dict["obj_1_tv"]
+            self.assertEqual(tv_item["placement_type"], "wall")
+            self.assertAlmostEqual(tv_item["delta_y_applied"], 0.0)
+
+            # Chair must have placement_type == "floor", delta_y == -0.4
+            chair_item = summary_dict["obj_2_chair"]
+            self.assertEqual(chair_item["placement_type"], "floor")
+            self.assertAlmostEqual(chair_item["delta_y_applied"], -0.4, places=4)
 
 
 if __name__ == "__main__":

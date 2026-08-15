@@ -86,12 +86,77 @@ def snap_mesh_to_surface(
     raise TypeError(f"[MeshPlacer] Unsupported mesh type: {type(mesh)}")
 
 
+def snap_mesh_to_wall(
+    mesh: Any,
+    wall_plane: Dict[str, Any],
+    margin: float = config.WALL_SNAPPING_MARGIN,
+) -> Tuple[Any, List[float]]:
+    """
+    Snap a 3D mesh horizontally against a vertical wall plane, preserving Y elevation.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh or open3d.geometry.TriangleMesh
+    wall_plane : Dict containing 'equation' [a, b, c, d] and 'normal' [nx, ny, nz]
+    margin : Offset margin from wall in meters. Default 0.01m.
+
+    Returns
+    -------
+    (transformed_mesh, delta_translation [dx, dy, dz])
+    """
+    eq = wall_plane.get("equation", [0.0, 0.0, 1.0, 0.0])
+    a, b, c, d = eq
+    normal = np.array([a, b, c], dtype=np.float64)
+    # Project normal vector to horizontal X-Z plane to ensure no vertical drift
+    normal_xz = np.array([normal[0], 0.0, normal[2]], dtype=np.float64)
+    norm_len = np.linalg.norm(normal_xz)
+    if norm_len < 1e-6:
+        return mesh, [0.0, 0.0, 0.0]
+    normal_xz = normal_xz / norm_len
+
+    if HAS_TRIMESH:
+        if isinstance(mesh, trimesh.Scene):
+            mesh = trimesh.util.concatenate(mesh.dump()) if len(mesh.dump()) > 0 else trimesh.Trimesh()
+
+    verts = np.asarray(mesh.vertices) if hasattr(mesh, "vertices") else np.zeros((0, 3))
+    if len(verts) == 0:
+        return mesh, [0.0, 0.0, 0.0]
+
+    # Signed distances of all vertices to the wall plane
+    signed_dists = verts[:, 0] * a + verts[:, 1] * b + verts[:, 2] * c + d
+    center_dist = float(np.mean(signed_dists))
+
+    # Identify the side facing the wall and the back point closest to the wall
+    if center_dist >= 0:
+        back_dist = float(np.min(signed_dists))
+        shift_amount = margin - back_dist
+    else:
+        back_dist = float(np.max(signed_dists))
+        shift_amount = -margin - back_dist
+
+    # Horizontal translation vector (purely X-Z)
+    delta_vec = [float(shift_amount * normal_xz[0]), 0.0, float(shift_amount * normal_xz[2])]
+
+    if HAS_TRIMESH and isinstance(mesh, trimesh.Trimesh):
+        mesh_copy = mesh.copy()
+        mesh_copy.apply_translation(delta_vec)
+        return mesh_copy, delta_vec
+
+    if HAS_OPEN3D and isinstance(mesh, o3d.geometry.TriangleMesh):
+        import copy
+        mesh_copy = copy.deepcopy(mesh)
+        mesh_copy.translate(delta_vec)
+        return mesh_copy, delta_vec
+
+    return mesh, [0.0, 0.0, 0.0]
+
+
 def align_and_place_object_meshes(
     objects_dir: Optional[Path | str] = None,
     plane_data_path: Optional[Path | str] = None,
     out_dir: Optional[Path | str] = None,
 ) -> List[Dict[str, Any]]:
-    """Align and snap all object meshes onto detected architectural planes."""
+    """Align and snap all object meshes onto detected architectural planes (Floors, Tables, Walls)."""
     if objects_dir is None:
         objects_dir = config.PROCESSED_DATA_DIR / "objects"
     objects_dir = Path(objects_dir)
@@ -108,6 +173,7 @@ def align_and_place_object_meshes(
     # Load plane metadata (from Phase 1 RoomBuilder)
     floor_y = 0.0
     table_planes: List[Dict[str, Any]] = []
+    wall_planes: List[Dict[str, Any]] = []
 
     if plane_data_path.exists():
         with open(plane_data_path, "r", encoding="utf-8") as pf:
@@ -116,8 +182,16 @@ def align_and_place_object_meshes(
         if floor:
             floor_y = float(floor.get("mean_y", 0.0))
         table_planes = planes_json.get("tables", [])
+        wall_planes = planes_json.get("walls", [])
     else:
         print(f"[MeshPlacer] Plane metadata file not found at {plane_data_path}. Defaulting floor_y = 0.0m")
+
+    # Load object manifest if available
+    manifest_path = objects_dir / "objects_manifest.json"
+    objects_manifest: Dict[str, Any] = {}
+    if manifest_path.exists():
+        with open(manifest_path, "r", encoding="utf-8") as mf:
+            objects_manifest = json.load(mf)
 
     # Find object mesh files (.ply, .obj)
     mesh_files = list(objects_dir.glob("*.ply")) + list(objects_dir.glob("*.obj"))
@@ -130,7 +204,7 @@ def align_and_place_object_meshes(
             box.export(str(test_mesh_path))
             mesh_files = [test_mesh_path]
 
-    print(f"[MeshPlacer] Aligning & Snapping {len(mesh_files)} object meshes onto support planes...")
+    print(f"[MeshPlacer] Aligning & Snapping {len(mesh_files)} object meshes onto support planes/walls...")
     aligned_summary: List[Dict[str, Any]] = []
 
     for m_path in mesh_files:
@@ -146,19 +220,60 @@ def align_and_place_object_meshes(
         else:
             raise ImportError("Either trimesh or open3d is required.")
 
-        # Determine target support plane
-        target_surface_y = floor_y
-        verts = np.asarray(mesh.vertices)
-        if len(verts) > 0:
-            obj_min_y = float(verts[:, 1].min())
-            obj_min_x = float(verts[:, 0].min())
-            obj_max_x = float(verts[:, 0].max())
-            obj_min_z = float(verts[:, 2].min())
-            obj_max_z = float(verts[:, 2].max())
-            obj_center_x = (obj_min_x + obj_max_x) / 2.0
-            obj_center_z = (obj_min_z + obj_max_z) / 2.0
+        # Determine object label / semantic category
+        obj_info = objects_manifest.get(m_path.stem, {})
+        label = obj_info.get("label", "")
+        if not label:
+            parts = m_path.stem.split("_")
+            if len(parts) > 2:
+                # Try joining last 2 parts first (e.g. 'wall_art' from 'obj_3_wall_art')
+                candidate = "_".join(parts[-2:]).lower()
+                label = candidate if candidate in config.WALL_MOUNTED_CLASSES else parts[-1].lower()
+            elif len(parts) > 1:
+                label = parts[-1].lower()
+            else:
+                label = m_path.stem.lower()
 
-            # Find valid support candidate planes (Floor + qualifying Tables beneath the object footprint)
+        is_wall_mounted = label.lower() in config.WALL_MOUNTED_CLASSES
+
+        verts = np.asarray(mesh.vertices) if hasattr(mesh, "vertices") else np.zeros((0, 3))
+        if len(verts) == 0:
+            continue
+
+        obj_min_y = float(verts[:, 1].min())
+        obj_min_x = float(verts[:, 0].min())
+        obj_max_x = float(verts[:, 0].max())
+        obj_min_z = float(verts[:, 2].min())
+        obj_max_z = float(verts[:, 2].max())
+        obj_center_x = (obj_min_x + obj_max_x) / 2.0
+        obj_center_y = float(verts[:, 1].mean())
+        obj_center_z = (obj_min_z + obj_max_z) / 2.0
+
+        if is_wall_mounted:
+            # Wall-mounted object: Snap horizontally to nearest vertical wall plane, keep Y elevation
+            if wall_planes:
+                _cx, _cy, _cz = obj_center_x, obj_center_y, obj_center_z
+                best_wall = min(
+                    wall_planes,
+                    key=lambda wp, cx=_cx, cy=_cy, cz=_cz: abs(
+                        wp.get("equation", [0, 0, 1, 0])[0] * cx
+                        + wp.get("equation", [0, 0, 1, 0])[1] * cy
+                        + wp.get("equation", [0, 0, 1, 0])[2] * cz
+                        + wp.get("equation", [0, 0, 1, 0])[3]
+                    ),
+                )
+                snapped_mesh, delta_vec = snap_mesh_to_wall(mesh, best_wall, margin=config.WALL_SNAPPING_MARGIN)
+                placement_type = "wall"
+                target_surface = f"wall_id_{best_wall.get('id')}"
+                delta_y = 0.0
+            else:
+                snapped_mesh = mesh
+                delta_vec = [0.0, 0.0, 0.0]
+                placement_type = "wall_unattached"
+                target_surface = "none"
+                delta_y = 0.0
+        else:
+            # Floor / Tabletop supported object: Snap vertically to surface beneath object
             candidate_support_y = [floor_y]
             for tp in table_planes:
                 t_y = float(tp.get("mean_y", 0.0))
@@ -174,10 +289,11 @@ def align_and_place_object_meshes(
                 if in_x and in_z and (obj_min_y >= t_y - 0.20):
                     candidate_support_y.append(t_y)
 
-            # Pick the highest qualifying support surface beneath the object
             target_surface_y = max(candidate_support_y)
-
-        snapped_mesh, delta_y = snap_mesh_to_surface(mesh, surface_y=target_surface_y)
+            snapped_mesh, delta_y = snap_mesh_to_surface(mesh, surface_y=target_surface_y)
+            delta_vec = [0.0, delta_y, 0.0]
+            placement_type = "table" if target_surface_y > (floor_y + 0.10) else "floor"
+            target_surface = f"Y={target_surface_y:.3f}m"
 
         out_path = out_dir / m_path.name
         if HAS_TRIMESH and isinstance(snapped_mesh, trimesh.Trimesh):
@@ -187,12 +303,15 @@ def align_and_place_object_meshes(
 
         aligned_summary.append({
             "name": m_path.stem,
+            "label": label,
+            "placement_type": placement_type,
             "original_path": str(m_path),
             "aligned_path": str(out_path),
-            "target_surface_y": target_surface_y,
+            "target_surface": target_surface,
+            "delta_translation": delta_vec,
             "delta_y_applied": delta_y,
         })
-        print(f"             - '{m_path.stem}': Min Y shifted {delta_y:+.3f}m -> Snapped to surface at Y={target_surface_y:.3f}m")
+        print(f"             - '{m_path.stem}' ({label}): [{placement_type}] -> Trans: {[round(v, 3) for v in delta_vec]} onto {target_surface}")
 
     manifest_out = out_dir / "aligned_objects_manifest.json"
     with open(manifest_out, "w", encoding="utf-8") as f:

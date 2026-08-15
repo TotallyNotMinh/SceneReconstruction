@@ -41,15 +41,23 @@ def _generate_synthetic_room_pcd(out_ply: Path, num_points: int = 10000) -> np.n
     rng = np.random.default_rng(42)
 
     # Floor at Y = 0.0, bounds X: [-3, 3], Z: [-3, 3]
-    n_floor = int(num_points * 0.5)
+    n_floor = int(num_points * 0.45)
     floor_x = rng.uniform(-3.0, 3.0, n_floor)
     floor_z = rng.uniform(-3.0, 3.0, n_floor)
     floor_y = rng.normal(0.0, 0.01, n_floor)
     floor_pts = np.column_stack([floor_x, floor_y, floor_z])
     floor_cols = np.tile([180, 180, 180], (n_floor, 1)).astype(np.uint8)
 
+    # Vertical Wall at Z = -2.0, bounds X: [-2.5, 2.5], Y: [0.0, 2.5]
+    n_wall = int(num_points * 0.20)
+    wall_x = rng.uniform(-2.5, 2.5, n_wall)
+    wall_y = rng.uniform(0.0, 2.5, n_wall)
+    wall_z = rng.normal(-2.0, 0.008, n_wall)
+    wall_pts = np.column_stack([wall_x, wall_y, wall_z])
+    wall_cols = np.tile([210, 210, 200], (n_wall, 1)).astype(np.uint8)
+
     # Tabletop at Y = 0.75, bounds X: [-0.8, 0.8], Z: [-0.5, 0.5]
-    n_table = int(num_points * 0.25)
+    n_table = int(num_points * 0.20)
     table_x = rng.uniform(-0.8, 0.8, n_table)
     table_z = rng.uniform(-0.5, 0.5, n_table)
     table_y = rng.normal(0.75, 0.008, n_table)
@@ -57,15 +65,15 @@ def _generate_synthetic_room_pcd(out_ply: Path, num_points: int = 10000) -> np.n
     table_cols = np.tile([130, 90, 50], (n_table, 1)).astype(np.uint8)
 
     # Object / Chair clutter points
-    n_obj = num_points - n_floor - n_table
+    n_obj = num_points - n_floor - n_wall - n_table
     obj_x = rng.uniform(-1.5, 1.5, n_obj)
     obj_z = rng.uniform(-1.5, 1.5, n_obj)
     obj_y = rng.uniform(0.1, 1.2, n_obj)
     obj_pts = np.column_stack([obj_x, obj_y, obj_z])
     obj_cols = np.tile([50, 120, 200], (n_obj, 1)).astype(np.uint8)
 
-    pts = np.vstack([floor_pts, table_pts, obj_pts])
-    cols = np.vstack([floor_cols, table_cols, obj_cols])
+    pts = np.vstack([floor_pts, wall_pts, table_pts, obj_pts])
+    cols = np.vstack([floor_cols, wall_cols, table_cols, obj_cols])
 
     out_ply.parent.mkdir(parents=True, exist_ok=True)
     if HAS_TRIMESH:
@@ -162,8 +170,9 @@ def detect_architectural_planes(
         max_b = bbox.get_max_bound().tolist()
         mean_y = float(np.mean(inlier_pts[:, 1]))
 
-        # Check if plane is horizontal (normal vector aligned with Y axis, i.e. |normal[1]| > tolerance)
+        # Check if plane is horizontal (normal vector aligned with Y axis) or vertical (normal in X-Z plane)
         is_horizontal = abs(normal[1]) >= config.ROOM_FLOOR_NORMAL_TOLERANCE
+        is_vertical = abs(normal[1]) <= config.ROOM_WALL_NORMAL_TOLERANCE
 
         raw_planes.append({
             "id": idx,
@@ -171,6 +180,7 @@ def detect_architectural_planes(
             "normal": normal.tolist(),
             "mean_y": mean_y,
             "is_horizontal": bool(is_horizontal),
+            "is_vertical": bool(is_vertical),
             "inlier_count": int(len(inliers)),
             "min_bound": min_b,
             "max_bound": max_b,
@@ -178,13 +188,20 @@ def detect_architectural_planes(
 
     if not raw_planes:
         print("[RoomBuilder] WARNING: No RANSAC planes were detected.")
-        return {"floor": None, "tables": [], "all_planes": []}
+        return {"floor": None, "tables": [], "walls": [], "all_planes": []}
 
     # Filter horizontal planes to separate Floor vs Tabletop
     horizontal_planes = [p for p in raw_planes if p["is_horizontal"]]
     if not horizontal_planes:
-        # Fallback to all planes sorted by Y height
-        horizontal_planes = sorted(raw_planes, key=lambda p: p["mean_y"])
+        # Fallback: exclude known vertical planes, use the rest sorted by Y height
+        horizontal_planes = sorted(
+            [p for p in raw_planes if not p.get("is_vertical", False)],
+            key=lambda p: p["mean_y"]
+        )
+        if not horizontal_planes:
+            # Total fallback — use all planes, accept inaccurate result
+            horizontal_planes = sorted(raw_planes, key=lambda p: p["mean_y"])
+            print("[RoomBuilder] WARNING: All RANSAC planes appear vertical — floor detection may be inaccurate.")
 
     # Floor identification: Among the lowest horizontal planes (bottom 40% height range or lowest 3),
     # pick the plane with the largest inlier count (dominant support surface)
@@ -199,15 +216,21 @@ def detect_architectural_planes(
         if (p["mean_y"] - floor_plane["mean_y"]) >= 0.25
     ]
 
+    # Wall planes: Vertical planes
+    wall_planes = [p for p in raw_planes if p.get("is_vertical", False)]
+
     print(f"[RoomBuilder] RANSAC Plane Detection complete:")
     print(f"             - Floor Plane Detected  : Y = {floor_plane['mean_y']:.3f}m (Inliers: {floor_plane['inlier_count']:,})")
     for t_idx, tp in enumerate(table_planes):
         print(f"             - Tabletop Plane #{t_idx+1}      : Y = {tp['mean_y']:.3f}m (Inliers: {tp['inlier_count']:,})")
+    for w_idx, wp in enumerate(wall_planes):
+        print(f"             - Wall Plane #{w_idx+1}          : Normal = {wp['normal']} (Inliers: {wp['inlier_count']:,})")
 
     # Export detected plane JSON metadata
     result = {
         "floor": floor_plane,
         "tables": table_planes,
+        "walls": wall_planes,
         "all_planes": raw_planes,
     }
 
@@ -270,6 +293,21 @@ def _export_room_layout_mesh(plane_data: Dict[str, Any], out_obj: Path):
             center_y = tp["mean_y"] - (size_y / 2.0)
             box.apply_translation([center_x, center_y, center_z])
             box.visual.vertex_colors = np.tile([70, 150, 220, 255], (len(box.vertices), 1)).astype(np.uint8)
+            meshes.append(box)
+
+        walls = plane_data.get("walls", [])
+        for wp in walls:
+            min_b = wp["min_bound"]
+            max_b = wp["max_bound"]
+            size_x = max(0.05, max_b[0] - min_b[0])
+            size_y = max(0.5, max_b[1] - min_b[1])
+            size_z = max(0.05, max_b[2] - min_b[2])
+            box = trimesh.creation.box(extents=[size_x, size_y, size_z])
+            center_x = (min_b[0] + max_b[0]) / 2.0
+            center_y = (min_b[1] + max_b[1]) / 2.0
+            center_z = (min_b[2] + max_b[2]) / 2.0
+            box.apply_translation([center_x, center_y, center_z])
+            box.visual.vertex_colors = np.tile([180, 180, 100, 220], (len(box.vertices), 1)).astype(np.uint8)
             meshes.append(box)
 
         if meshes:
