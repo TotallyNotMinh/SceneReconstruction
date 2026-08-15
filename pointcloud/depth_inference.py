@@ -24,17 +24,6 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 from core import video_normalizer
 
-try:
-    import torch
-    from PIL import Image
-    from depth_anything_3.api import DepthAnything3
-except ImportError as _e:
-    sys.exit(
-        "[ERROR] Missing required packages.\n"
-        "  Install with: pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git\n"
-        f"  Detail: {_e}"
-    )
-
 DEFAULT_NPZ_PATH = config.PROCESSED_DATA_DIR / "raw_depths.npz"
 RAW_META_PATH    = config.PROCESSED_DATA_DIR / "ar_metadata.json"
 
@@ -51,6 +40,16 @@ def preprocess_video(
 
 
 def load_depth_anything_model(model_id: str = config.DEPTH_MODEL_ID, device=None):
+    try:
+        import torch
+        from depth_anything_3.api import DepthAnything3
+    except ImportError as _e:
+        sys.exit(
+            "[ERROR] Missing required packages.\n"
+            "  Install with: pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git\n"
+            f"  Detail: {_e}"
+        )
+
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -79,192 +78,196 @@ def run_depth_inference(
 
     preprocessed_path: Path | None = None
     prep_meta: dict = {}
-    if not skip_preprocess:
-        try:
-            preprocessed_path, prep_meta = preprocess_video(
-                video_path,
-                target_long_edge=target_long_edge,
-                target_fps=target_fps,
-            )
-            working_path = preprocessed_path
-        except RuntimeError as exc:
-            print(f"[WARNING] Video preprocessing failed — using original video.\n  {exc}")
+    try:
+        if not skip_preprocess:
+            try:
+                preprocessed_path, prep_meta = preprocess_video(
+                    video_path,
+                    target_long_edge=target_long_edge,
+                    target_fps=target_fps,
+                )
+                working_path = preprocessed_path
+            except RuntimeError as exc:
+                print(f"[WARNING] Video preprocessing failed — using original video.\n  {exc}")
+                working_path = video_path
+        else:
+            print(f"[+] Skipping video preprocessing — using raw input video: {video_path.name}")
             working_path = video_path
-    else:
-        print(f"[+] Skipping video preprocessing — using raw input video: {video_path.name}")
-        working_path = video_path
 
-    model, device = load_depth_anything_model(model_id=model_id)
+        from PIL import Image
+        import torch
 
-    cap = cv2.VideoCapture(str(working_path))
-    if not cap.isOpened():
-        sys.exit(f"[ERROR] Cannot open processed video: {working_path}")
+        model, device = load_depth_anything_model(model_id=model_id)
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps          = cap.get(cv2.CAP_PROP_FPS)
+        cap = cv2.VideoCapture(str(working_path))
+        if not cap.isOpened():
+            sys.exit(f"[ERROR] Cannot open processed video: {working_path}")
 
-    print(f"[+] Processing '{working_path.name}' ({w}x{h} @ {fps:.1f} FPS, {total_frames} frames)")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps          = cap.get(cv2.CAP_PROP_FPS)
 
-    orig_intrinsics = prep_meta.get("orig_intrinsics", [1.2 * max(w, h), 1.2 * max(w, h), w / 2.0, h / 2.0])
-    rescaled_intrinsics = prep_meta.get("processed_intrinsics", [1.2 * max(w, h), 1.2 * max(w, h), w / 2.0, h / 2.0])
-    scale_x = prep_meta.get("scale_x", 1.0)
-    scale_y = prep_meta.get("scale_y", 1.0)
+        print(f"[+] Processing '{working_path.name}' ({w}x{h} @ {fps:.1f} FPS, {total_frames} frames)")
 
-    intrinsics = np.array(rescaled_intrinsics, dtype=np.float64)
-    if total_frames <= max_frames:
-        sampled_indices = list(range(0, total_frames, max(1, sample_stride)))
-    else:
-        # Uniformly distribute max_frames across the ENTIRE duration of the video (from 0% to 100%)
-        sampled_indices = np.linspace(0, total_frames - 1, num=max_frames, dtype=int).tolist()
-        sampled_indices = sorted(list(dict.fromkeys(sampled_indices)))
+        orig_intrinsics = prep_meta.get("orig_intrinsics", [1.2 * max(w, h), 1.2 * max(w, h), w / 2.0, h / 2.0])
+        rescaled_intrinsics = prep_meta.get("processed_intrinsics", [1.2 * max(w, h), 1.2 * max(w, h), w / 2.0, h / 2.0])
+        scale_x = prep_meta.get("scale_x", 1.0)
+        scale_y = prep_meta.get("scale_y", 1.0)
 
-    print(f"[+] Decoding {len(sampled_indices)} frames uniformly across full video (span: frames {sampled_indices[0]}..{sampled_indices[-1]} of {total_frames})...")
-    pil_images = []
-    rgb_frames = []
-    valid_indices = []
+        intrinsics = np.array(rescaled_intrinsics, dtype=np.float64)
+        if total_frames <= max_frames:
+            sampled_indices = list(range(0, total_frames, max(1, sample_stride)))
+        else:
+            # Uniformly distribute max_frames across the ENTIRE duration of the video (from 0% to 100%)
+            sampled_indices = np.linspace(0, total_frames - 1, num=max_frames, dtype=int).tolist()
+            sampled_indices = sorted(list(dict.fromkeys(sampled_indices)))
 
-    pbar = tqdm(total=len(sampled_indices), desc="[Decoding Frames]", unit="frame")
-    for idx, target_idx in enumerate(sampled_indices):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
-        ret, frame_bgr = cap.read()
-        if not ret:
+        print(f"[+] Decoding {len(sampled_indices)} frames uniformly across full video (span: frames {sampled_indices[0]}..{sampled_indices[-1]} of {total_frames})...")
+        pil_images = []
+        rgb_frames = []
+        valid_indices = []
+
+        pbar = tqdm(total=len(sampled_indices), desc="[Decoding Frames]", unit="frame")
+        for idx, target_idx in enumerate(sampled_indices):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+            ret, frame_bgr = cap.read()
+            if not ret:
+                pbar.update(1)
+                continue
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            rgb_frames.append(frame_rgb)
+            pil_images.append(Image.fromarray(frame_rgb))
+            valid_indices.append(idx)
             pbar.update(1)
-            continue
 
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        rgb_frames.append(frame_rgb)
-        pil_images.append(Image.fromarray(frame_rgb))
-        valid_indices.append(idx)
-        pbar.update(1)
+        pbar.close()
+        cap.release()
 
-    pbar.close()
-    cap.release()
+        if not pil_images:
+            sys.exit("[ERROR] Failed to extract any valid frames from video.")
 
-    if not pil_images:
-        sys.exit("[ERROR] Failed to extract any valid frames from video.")
+        print(f"[+] Pass 1 — running Depth Anything V3 joint multi-view inference on {len(pil_images)} frames.")
+        with torch.no_grad():
+            result = model.inference(pil_images)
 
-    print(f"[+] Pass 1 — running Depth Anything V3 joint multi-view inference on {len(pil_images)} frames.")
-    with torch.no_grad():
-        result = model.inference(pil_images)
+        raw_depths = result.depth
+        raw_exts   = result.extrinsics
+        raw_ixts   = result.intrinsics
+        raw_confs  = getattr(result, "conf", None)
+        proc_imgs  = getattr(result, "processed_images", None)
 
-    raw_depths = result.depth
-    raw_exts   = result.extrinsics
-    raw_ixts   = result.intrinsics
-    raw_confs  = getattr(result, "conf", None)
-    proc_imgs  = getattr(result, "processed_images", None)
+        frames_meta_raw = []
+        for idx, i in enumerate(valid_indices):
+            ext_mat = np.eye(4, dtype=np.float32)
+            if raw_exts is not None:
+                e = raw_exts[idx]
+                ext_mat[:e.shape[0], :e.shape[1]] = e
 
-    frames_meta_raw = []
-    for idx, i in enumerate(valid_indices):
-        ext_mat = np.eye(4, dtype=np.float32)
-        if raw_exts is not None:
-            e = raw_exts[idx]
-            ext_mat[:e.shape[0], :e.shape[1]] = e
+            video_frame_id = sampled_indices[i]
+            frame_dict = {
+                "index": int(i),
+                "video_frame_index": int(video_frame_id),
+                "pose_matrix": ext_mat.tolist(),
+            }
+            if raw_ixts is not None:
+                ixt = raw_ixts[idx]
+                frame_dict["fl_x"] = float(ixt[0, 0])
+                frame_dict["fl_y"] = float(ixt[1, 1])
+                frame_dict["cx"]   = float(ixt[0, 2])
+                frame_dict["cy"]   = float(ixt[1, 2])
+                frame_dict["w"]    = int(w)
+                frame_dict["h"]    = int(h)
+            frames_meta_raw.append(frame_dict)
 
-        video_frame_id = sampled_indices[i]
-        frame_dict = {
-            "index": int(i),
-            "video_frame_index": int(video_frame_id),
-            "pose_matrix": ext_mat.tolist(),
+        if prep_meta:
+            meta_payload = {
+                "w": w,
+                "h": h,
+                "scale_x": scale_x,
+                "scale_y": scale_y,
+                "orig_intrinsics": orig_intrinsics,
+                "processed_intrinsics": rescaled_intrinsics,
+                "frames": frames_meta_raw,
+            }
+        else:
+            meta_payload = {
+                "w": w,
+                "h": h,
+                "fl_x": float(intrinsics[0]),
+                "fl_y": float(intrinsics[1]),
+                "cx": float(intrinsics[2]),
+                "cy": float(intrinsics[3]),
+                "frames": frames_meta_raw,
+            }
+
+        raw_meta_path = RAW_META_PATH
+        raw_meta_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(raw_meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_payload, f, indent=2)
+        print(f"[+] Saved AR metadata ({len(frames_meta_raw)} frames) -> {raw_meta_path}")
+
+        print(f"[+] Pass 1 done — {len(raw_depths)} frames processed.")
+
+        npz_out = Path(npz_out)
+        npz_out.parent.mkdir(parents=True, exist_ok=True)
+
+        arrays: dict = {
+            "video_w":         np.int64(w),
+            "video_h":         np.int64(h),
+            "video_fps":       np.float64(fps),
+            "scale_x":         np.float64(scale_x),
+            "scale_y":         np.float64(scale_y),
+            "intrinsics":      intrinsics,
+            "orig_intrinsics": np.array(orig_intrinsics, dtype=np.float64),
+            "frames_meta":     np.bytes_(json.dumps(frames_meta_raw, separators=(",", ":"))
+                                         .encode("utf-8")),
         }
-        if raw_ixts is not None:
-            ixt = raw_ixts[idx]
-            frame_dict["fl_x"] = float(ixt[0, 0])
-            frame_dict["fl_y"] = float(ixt[1, 1])
-            frame_dict["cx"]   = float(ixt[0, 2])
-            frame_dict["cy"]   = float(ixt[1, 2])
-            frame_dict["w"]    = int(w)
-            frame_dict["h"]    = int(h)
-        frames_meta_raw.append(frame_dict)
+        for idx, i in enumerate(valid_indices):
+            d_arr = raw_depths[idx].astype(np.float32)
+            if d_arr.shape[:2] != (h, w):
+                d_arr = cv2.resize(d_arr, (w, h), interpolation=cv2.INTER_NEAREST)
+            arrays[f"depth_{i}"] = d_arr
 
-    if prep_meta:
-        meta_payload = {
-            "w": w,
-            "h": h,
-            "scale_x": scale_x,
-            "scale_y": scale_y,
-            "orig_intrinsics": orig_intrinsics,
-            "processed_intrinsics": rescaled_intrinsics,
-            "frames": frames_meta_raw,
-        }
-    else:
-        meta_payload = {
-            "w": w,
-            "h": h,
-            "fl_x": float(intrinsics[0]),
-            "fl_y": float(intrinsics[1]),
-            "cx": float(intrinsics[2]),
-            "cy": float(intrinsics[3]),
-            "frames": frames_meta_raw,
-        }
+            if raw_exts is not None:
+                arrays[f"ext_{i}"] = raw_exts[idx].astype(np.float32)
 
-    raw_meta_path = RAW_META_PATH
-    raw_meta_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(raw_meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta_payload, f, indent=2)
-    print(f"[+] Saved AR metadata ({len(frames_meta_raw)} frames) -> {raw_meta_path}")
+            if raw_ixts is not None:
+                ixt_arr = raw_ixts[idx].astype(np.float32)
+                if proc_imgs is not None:
+                    orig_h, orig_w = proc_imgs[idx].shape[:2]
+                else:
+                    orig_h, orig_w = h, w
+                sx = w / orig_w
+                sy = h / orig_h
+                ixt_arr[0, 0] *= sx
+                ixt_arr[1, 1] *= sy
+                ixt_arr[0, 2] *= sx
+                ixt_arr[1, 2] *= sy
+                arrays[f"ixt_{i}"] = ixt_arr
 
-    if preprocessed_path is not None and preprocessed_path.exists():
-        try:
-            preprocessed_path.unlink()
-        except OSError:
-            pass
+            if raw_confs is not None:
+                c_arr = raw_confs[idx].astype(np.float32)
+                if c_arr.shape[:2] != (h, w):
+                    c_arr = cv2.resize(c_arr, (w, h), interpolation=cv2.INTER_NEAREST)
+                arrays[f"conf_{i}"] = c_arr
 
-    print(f"[+] Pass 1 done — {len(raw_depths)} frames processed.")
+            rgb_img = proc_imgs[idx] if proc_imgs is not None else rgb_frames[idx]
+            if rgb_img.shape[:2] != (h, w):
+                rgb_img = cv2.resize(rgb_img, (w, h), interpolation=cv2.INTER_LINEAR)
+            arrays[f"rgb_{i}"] = rgb_img
 
-    npz_out = Path(npz_out)
-    npz_out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(str(npz_out), **arrays)
+        print(f"[+] Raw depths + predicted camera poses saved ({len(raw_depths)} frames) -> {npz_out}")
 
-    arrays: dict = {
-        "video_w":         np.int64(w),
-        "video_h":         np.int64(h),
-        "video_fps":       np.float64(fps),
-        "scale_x":         np.float64(scale_x),
-        "scale_y":         np.float64(scale_y),
-        "intrinsics":      intrinsics,
-        "orig_intrinsics": np.array(orig_intrinsics, dtype=np.float64),
-        "frames_meta":     np.bytes_(json.dumps(frames_meta_raw, separators=(",", ":"))
-                                     .encode("utf-8")),
-    }
-    for idx, i in enumerate(valid_indices):
-        d_arr = raw_depths[idx].astype(np.float32)
-        if d_arr.shape[:2] != (h, w):
-            d_arr = cv2.resize(d_arr, (w, h), interpolation=cv2.INTER_NEAREST)
-        arrays[f"depth_{i}"] = d_arr
-
-        if raw_exts is not None:
-            arrays[f"ext_{i}"] = raw_exts[idx].astype(np.float32)
-
-        if raw_ixts is not None:
-            ixt_arr = raw_ixts[idx].astype(np.float32)
-            if proc_imgs is not None:
-                orig_h, orig_w = proc_imgs[idx].shape[:2]
-            else:
-                orig_h, orig_w = h, w
-            sx = w / orig_w
-            sy = h / orig_h
-            ixt_arr[0, 0] *= sx
-            ixt_arr[1, 1] *= sy
-            ixt_arr[0, 2] *= sx
-            ixt_arr[1, 2] *= sy
-            arrays[f"ixt_{i}"] = ixt_arr
-
-        if raw_confs is not None:
-            c_arr = raw_confs[idx].astype(np.float32)
-            if c_arr.shape[:2] != (h, w):
-                c_arr = cv2.resize(c_arr, (w, h), interpolation=cv2.INTER_NEAREST)
-            arrays[f"conf_{i}"] = c_arr
-
-        rgb_img = proc_imgs[idx] if proc_imgs is not None else rgb_frames[idx]
-        if rgb_img.shape[:2] != (h, w):
-            rgb_img = cv2.resize(rgb_img, (w, h), interpolation=cv2.INTER_LINEAR)
-        arrays[f"rgb_{i}"] = rgb_img
-
-    np.savez_compressed(str(npz_out), **arrays)
-    print(f"[+] Raw depths + predicted camera poses saved ({len(raw_depths)} frames) -> {npz_out}")
-
-    return npz_out
+        return npz_out
+    finally:
+        if preprocessed_path is not None and preprocessed_path.exists():
+            try:
+                preprocessed_path.unlink()
+            except OSError:
+                pass
 
 
 def generate_pcd_from_video(

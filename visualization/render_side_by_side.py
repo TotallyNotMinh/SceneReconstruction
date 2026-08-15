@@ -24,16 +24,16 @@ if hasattr(sys.stdout, 'reconfigure'):
 else:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-try:
-    import torch
-    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-except ImportError:
-    sys.exit("[ERROR] Missing required libraries: torch, transformers, pillow.")
-
 OUT_VIDEO_PATH = config.OUTPUT_DIR / "demo_side_by_side_depth.mp4"
 
 
 def load_depth_model(device=None):
+    try:
+        import torch
+        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+    except ImportError as _e:
+        sys.exit(f"[ERROR] Missing required libraries: torch, transformers, pillow.\n  Detail: {_e}")
+
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 

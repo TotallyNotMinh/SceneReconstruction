@@ -24,7 +24,7 @@ YOLO_MODEL_PATH    = WEIGHTS_DIR / "yolo11m-seg.pt"
 SAM_CHECKPOINT_PATH = WEIGHTS_DIR / "mobile_sam.pt"
 
 # ── Point-cloud Processing ───────────────────────────────────────────────────
-VOXEL_SIZE_PCD     = 0.005      # Voxel grid cell size (m)
+VOXEL_SIZE_PCD     = 0.02       # Voxel grid cell size (m)
 DEPTH_METRIC_MIN   = 0.5       # Near clamp for metric depth (m)
 DEPTH_METRIC_MAX   = 5.0       # Far clamp for metric depth (m)
 ENABLE_ROR         = False     # Enable Radius Outlier Removal by default
@@ -56,6 +56,18 @@ DBSCAN_EPS              = 0.05  # DBSCAN neighbourhood radius (m)
 DBSCAN_MIN_SAMPLES      = 10    # Minimum points to form a cluster
 DBSCAN_MIN_CLUSTER_SIZE = 50    # Minimum cluster size to keep
 OCCLUSION_MIN_CONSENSUS = 0.60  # Fraction of views a point must be visible in
+
+# ── RoomBuilder & RANSAC Plane Detection ──────────────────────────────────────
+RANSAC_DISTANCE_THRESH      = 0.03   # Max inlier distance for RANSAC floor/table plane extraction (m)
+RANSAC_N                    = 3      # Number of points sampled per RANSAC plane hypothesis
+RANSAC_NUM_ITERATIONS       = 1000   # Number of RANSAC iterations
+ROOM_FLOOR_NORMAL_TOLERANCE = 0.85   # Min abs(dot(normal, gravity_up)) to qualify as horizontal plane
+
+# ── ObjectEstimator & 3D Surface Meshing ─────────────────────────────────────
+ALPHA_SHAPE_ALPHA           = 0.10   # Alpha-Shape concavity parameter for 3D mesh surface generation (m)
+
+# ── MeshPlacer & Surface Snapping ────────────────────────────────────────────
+SURFACE_SNAPPING_MARGIN     = 0.00   # Vertical offset margin when snapping mesh bottom to surface (m)
 
 
 # ── Video Normalizer ─────────────────────────────────────────────────────────

@@ -281,6 +281,91 @@ class TestFilters(unittest.TestCase):
         self.assertIsNotNone(cols)
 
 
+from spatial.room_builder import detect_architectural_planes
+from spatial.object_estimator import backproject_mask_to_3d, filter_object_pointcloud_dbscan
+from spatial.mesh_placer import snap_mesh_to_surface
+import trimesh
+
+
+class TestSpatialPhase1RoomBuilder(unittest.TestCase):
+
+    def test_detect_architectural_planes_synthetic(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ply_path = Path(tmp_dir) / "synthetic_room.ply"
+            out_obj = Path(tmp_dir) / "room_layout.obj"
+            out_json = Path(tmp_dir) / "detected_planes.json"
+
+            result = detect_architectural_planes(
+                ply_path=ply_path,
+                distance_threshold=0.04,
+                max_planes=3,
+                out_obj=out_obj,
+                out_json=out_json,
+            )
+
+            self.assertIsNotNone(result["floor"])
+            self.assertAlmostEqual(result["floor"]["mean_y"], 0.0, delta=0.1)
+            self.assertTrue(out_obj.exists())
+            self.assertTrue(out_json.exists())
+
+            # Verify plane equation normalization
+            for plane in result["all_planes"]:
+                eq = plane["equation"]
+                norm_len = np.linalg.norm(eq[:3])
+                self.assertAlmostEqual(norm_len, 1.0, places=5)
+
+
+class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
+
+    def test_backproject_mask_to_3d(self):
+        mask_2d = np.zeros((50, 50), dtype=np.uint8)
+        mask_2d[10:30, 10:30] = 255
+        depth_map = np.ones((50, 50), dtype=np.float64) * 2.0
+        K = np.array([[50.0, 0.0, 25.0], [0.0, 50.0, 25.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        c2w = np.eye(4, dtype=np.float64)
+
+        pts_w, _ = backproject_mask_to_3d(mask_2d, depth_map, K, c2w)
+        self.assertEqual(len(pts_w), 20 * 20)
+        self.assertAlmostEqual(pts_w[:, 2].mean(), 2.0, places=4)
+
+    def test_dbscan_filtering(self):
+        rng = np.random.default_rng(42)
+        dense = rng.uniform(-0.05, 0.05, size=(100, 3))
+        noise = np.array([[10.0, 10.0, 10.0]], dtype=np.float64)
+        pts = np.vstack([dense, noise])
+
+        clean_pts, _ = filter_object_pointcloud_dbscan(pts, eps=0.1, min_samples=5, min_cluster_size=20)
+        self.assertEqual(len(clean_pts), 100)
+
+
+class TestSpatialPhase3MeshPlacer(unittest.TestCase):
+
+    def test_snap_mesh_to_surface(self):
+        box = trimesh.creation.box(extents=[0.4, 0.8, 0.4])
+        # Position box so its bottom min_y is at Y = 0.5m
+        box.apply_translation([0.0, 0.9, 0.0])
+        min_y_before = float(box.vertices[:, 1].min())
+        self.assertAlmostEqual(min_y_before, 0.5, places=4)
+
+        snapped_box, delta_y = snap_mesh_to_surface(box, surface_y=0.0, margin=0.0)
+        min_y_after = float(snapped_box.vertices[:, 1].min())
+
+        self.assertAlmostEqual(delta_y, -0.5, places=4)
+        self.assertAlmostEqual(min_y_after, 0.0, places=4)
+
+    def test_snap_mesh_scene_input(self):
+        box = trimesh.creation.box(extents=[0.4, 0.8, 0.4])
+        box.apply_translation([0.0, 0.9, 0.0])
+        scene = trimesh.Scene(box)
+
+        snapped_mesh, delta_y = snap_mesh_to_surface(scene, surface_y=0.0, margin=0.0)
+        self.assertIsInstance(snapped_mesh, trimesh.Trimesh)
+        min_y_after = float(snapped_mesh.vertices[:, 1].min())
+        self.assertAlmostEqual(min_y_after, 0.0, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
 
