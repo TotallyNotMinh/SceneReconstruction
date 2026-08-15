@@ -281,11 +281,56 @@ class TestFilters(unittest.TestCase):
         self.assertIsNotNone(cols)
 
 
-from spatial.room_builder import detect_architectural_planes
+from spatial.room_builder import detect_architectural_planes, _compute_oriented_wall_geometry
 from spatial.object_estimator import backproject_mask_to_3d, filter_object_pointcloud_dbscan, process_object_detections
 from spatial.mesh_placer import snap_mesh_to_surface, snap_mesh_to_wall, align_and_place_object_meshes
 import trimesh
 import json
+
+
+def _create_test_room_pointcloud(out_ply: Path, num_points: int = 8000) -> np.ndarray:
+    """Helper fixture to generate a temporary test point cloud for spatial tests."""
+    rng = np.random.default_rng(42)
+
+    # Floor at Y = 0.0, bounds X: [-2.5, 2.5], Z: [-2.5, 2.5]
+    n_floor = int(num_points * 0.45)
+    floor_x = rng.uniform(-2.5, 2.5, n_floor)
+    floor_z = rng.uniform(-2.5, 2.5, n_floor)
+    floor_y = rng.normal(0.0, 0.005, n_floor)
+    floor_pts = np.column_stack([floor_x, floor_y, floor_z])
+    floor_cols = np.tile([180, 180, 180], (n_floor, 1)).astype(np.uint8)
+
+    # Vertical Wall at Z = -2.0, bounds X: [-2.0, 2.0], Y: [0.0, 2.2]
+    n_wall = int(num_points * 0.25)
+    wall_x = rng.uniform(-2.0, 2.0, n_wall)
+    wall_y = rng.uniform(0.0, 2.2, n_wall)
+    wall_z = rng.normal(-2.0, 0.005, n_wall)
+    wall_pts = np.column_stack([wall_x, wall_y, wall_z])
+    wall_cols = np.tile([210, 210, 200], (n_wall, 1)).astype(np.uint8)
+
+    # Tabletop at Y = 0.75, bounds X: [-0.6, 0.6], Z: [-0.4, 0.4]
+    n_table = int(num_points * 0.15)
+    table_x = rng.uniform(-0.6, 0.6, n_table)
+    table_z = rng.uniform(-0.4, 0.4, n_table)
+    table_y = rng.normal(0.75, 0.005, n_table)
+    table_pts = np.column_stack([table_x, table_y, table_z])
+    table_cols = np.tile([130, 90, 50], (n_table, 1)).astype(np.uint8)
+
+    # Clutter / Object points
+    n_obj = num_points - n_floor - n_wall - n_table
+    obj_x = rng.uniform(-1.0, 1.0, n_obj)
+    obj_z = rng.uniform(-1.0, 1.0, n_obj)
+    obj_y = rng.uniform(0.1, 1.0, n_obj)
+    obj_pts = np.column_stack([obj_x, obj_y, obj_z])
+    obj_cols = np.tile([50, 120, 200], (n_obj, 1)).astype(np.uint8)
+
+    pts = np.vstack([floor_pts, wall_pts, table_pts, obj_pts])
+    cols = np.vstack([floor_cols, wall_cols, table_cols, obj_cols])
+
+    out_ply.parent.mkdir(parents=True, exist_ok=True)
+    cloud = trimesh.PointCloud(vertices=pts, colors=cols)
+    cloud.export(str(out_ply))
+    return pts
 
 
 class TestSpatialPhase1RoomBuilder(unittest.TestCase):
@@ -293,6 +338,7 @@ class TestSpatialPhase1RoomBuilder(unittest.TestCase):
     def test_detect_architectural_planes_synthetic(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             ply_path = Path(tmp_dir) / "synthetic_room.ply"
+            _create_test_room_pointcloud(ply_path)
             out_obj = Path(tmp_dir) / "room_layout.obj"
             out_json = Path(tmp_dir) / "detected_planes.json"
 
@@ -311,11 +357,50 @@ class TestSpatialPhase1RoomBuilder(unittest.TestCase):
             self.assertTrue(out_obj.exists())
             self.assertTrue(out_json.exists())
 
+            # Verify Oriented Bounding Box geometry
+            for wall in result["walls"]:
+                self.assertIn("oriented_box", wall)
+                obb = wall["oriented_box"]
+                self.assertGreater(obb["length"], 0.0)
+                self.assertGreater(obb["height"], 0.0)
+                self.assertAlmostEqual(obb["thickness"], config.WALL_THICKNESS)
+                self.assertEqual(len(obb["transform_matrix"]), 4)
+
             # Verify plane equation normalization
             for plane in result["all_planes"]:
                 eq = plane["equation"]
                 norm_len = np.linalg.norm(eq[:3])
                 self.assertAlmostEqual(norm_len, 1.0, places=5)
+
+    def test_detect_architectural_planes_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            missing_ply = Path(tmp_dir) / "non_existent.ply"
+            with self.assertRaises(FileNotFoundError):
+                detect_architectural_planes(ply_path=missing_ply)
+
+    def test_compute_oriented_wall_geometry_clamping(self):
+        # Case 1: Wall points starting near floor (min_y = 0.10m, floor_y = 0.0m) -> Clamped to floor_y
+        pts_near = np.array([
+            [-1.0, 0.10, -2.0],
+            [1.0, 0.10, -2.0],
+            [0.0, 2.0, -2.0]
+        ], dtype=np.float64)
+        normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        obb_near = _compute_oriented_wall_geometry(pts_near, normal, floor_y=0.0)
+        # base_y should be snapped to 0.0, center_y = 0.0 + 2.0/2.0 = 1.0
+        self.assertAlmostEqual(obb_near["height"], 2.0, places=4)
+        self.assertAlmostEqual(obb_near["center"][1], 1.0, places=4)
+
+        # Case 2: Hanging wall divider (min_y = 0.50m, floor_y = 0.0m) -> NOT clamped to floor_y
+        pts_hanging = np.array([
+            [-1.0, 0.50, -2.0],
+            [1.0, 0.50, -2.0],
+            [0.0, 2.0, -2.0]
+        ], dtype=np.float64)
+        obb_hanging = _compute_oriented_wall_geometry(pts_hanging, normal, floor_y=0.0)
+        # base_y remains 0.50, height = 2.0 - 0.50 = 1.50
+        self.assertAlmostEqual(obb_hanging["height"], 1.50, places=4)
+        self.assertAlmostEqual(obb_hanging["center"][1], 1.25, places=4)
 
 
 class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
@@ -327,9 +412,23 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
         K = np.array([[50.0, 0.0, 25.0], [0.0, 50.0, 25.0], [0.0, 0.0, 1.0]], dtype=np.float64)
         c2w = np.eye(4, dtype=np.float64)
 
-        pts_w, _ = backproject_mask_to_3d(mask_2d, depth_map, K, c2w)
+        pts_w, _ = backproject_mask_to_3d(mask_2d, depth_map, K, c2w, foreground_margin=0.0)
         self.assertEqual(len(pts_w), 20 * 20)
         self.assertAlmostEqual(pts_w[:, 2].mean(), 2.0, places=4)
+
+    def test_backproject_foreground_depth_gating(self):
+        # Object mask at depth 1.5m, with background wall bleed at depth 4.0m
+        mask_2d = np.ones((40, 40), dtype=np.uint8)
+        depth_map = np.ones((40, 40), dtype=np.float64) * 1.5
+        depth_map[25:, :] = 4.0  # Background bleed
+        K = np.array([[50.0, 0.0, 20.0], [0.0, 50.0, 20.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        c2w = np.eye(4, dtype=np.float64)
+
+        pts_w, _ = backproject_mask_to_3d(mask_2d, depth_map, K, c2w, foreground_margin=0.35)
+        # Background depth 4.0m should be pruned because median is ~1.5m
+        self.assertGreater(len(pts_w), 0)
+        self.assertLess(len(pts_w), 40 * 40)
+        self.assertTrue(np.all(pts_w[:, 2] <= 2.0))
 
     def test_dbscan_filtering(self):
         rng = np.random.default_rng(42)
@@ -340,16 +439,15 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
         clean_pts, _ = filter_object_pointcloud_dbscan(pts, eps=0.1, min_samples=5, min_cluster_size=20)
         self.assertEqual(len(clean_pts), 100)
 
-    def test_process_object_detections_with_3x4_extrinsics(self):
+    def test_process_object_detections_with_3x4_extrinsics_and_polygon_mask(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             npz_path = Path(tmp_dir) / "raw_depths.npz"
             det_path = Path(tmp_dir) / "detections.json"
             out_dir = Path(tmp_dir) / "objects"
 
-            # Create mock depth and 3x4 extrinsics
             depth_0 = np.ones((60, 60), dtype=np.float32) * 1.8
             ixt_0 = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-            ext_0 = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], dtype=np.float64)  # (3, 4)
+            ext_0 = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], dtype=np.float64)
             np.savez(str(npz_path), depth_0=depth_0, ixt_0=ixt_0, ext_0=ext_0)
 
             det_data = {
@@ -357,14 +455,18 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
                     "label": "chair",
                     "class_id": 56,
                     "associated_views": [
-                        {"frame_index": 0, "bbox": [15, 15, 45, 45], "score": 0.95}
+                        {
+                            "frame_index": 0,
+                            "bbox": [15, 15, 45, 45],
+                            "mask": [[15, 15], [45, 15], [45, 45], [15, 45]],
+                            "score": 0.95,
+                        }
                     ]
                 }
             }
             with open(det_path, "w", encoding="utf-8") as f:
                 json.dump(det_data, f)
 
-            # This must run without (4, 3) @ (4, N) shape mismatch exception
             result = process_object_detections(
                 detections_path=det_path,
                 raw_depths_path=npz_path,
@@ -373,6 +475,76 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
             self.assertIn("obj_1", result)
             self.assertGreater(result["obj_1"]["point_count"], 0)
             self.assertTrue(Path(result["obj_1"]["mesh_path"]).exists())
+
+    def test_process_object_detections_with_flat_polygon_mask(self):
+        # Test flat mask list: [x1, y1, x2, y2, x3, y3, x4, y4]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            npz_path = Path(tmp_dir) / "raw_depths.npz"
+            det_path = Path(tmp_dir) / "detections.json"
+            out_dir = Path(tmp_dir) / "objects"
+
+            depth_0 = np.ones((60, 60), dtype=np.float32) * 1.8
+            ixt_0 = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+            ext_0 = np.eye(4, dtype=np.float64)
+            np.savez(str(npz_path), depth_0=depth_0, ixt_0=ixt_0, ext_0=ext_0)
+
+            det_data = {
+                "obj_flat": {
+                    "label": "table",
+                    "associated_views": [
+                        {
+                            "frame_index": 0,
+                            "bbox": [10, 10, 50, 50],
+                            "mask": [10, 10, 50, 10, 50, 50, 10, 50],  # Flat list format
+                        }
+                    ]
+                }
+            }
+            with open(det_path, "w", encoding="utf-8") as f:
+                json.dump(det_data, f)
+
+            result = process_object_detections(
+                detections_path=det_path,
+                raw_depths_path=npz_path,
+                out_dir=out_dir
+            )
+            self.assertIn("obj_flat", result)
+            self.assertGreater(result["obj_flat"]["point_count"], 0)
+            self.assertTrue(Path(result["obj_flat"]["mesh_path"]).exists())
+
+    def test_dbscan_dominant_cluster_adaptive_merge(self):
+        rng = np.random.default_rng(42)
+        # Cluster 1: Primary body (e.g. sofa seat), 150 points in a dense box around (0, 0, 0)
+        c1 = rng.uniform(-0.15, 0.15, size=(150, 3))
+        # Cluster 2: Armrest adjacent to sofa seat, 50 points in a dense box around (0.35, 0.05, 0)
+        c2 = rng.uniform(-0.05, 0.05, size=(50, 3)) + np.array([0.35, 0.05, 0.0])
+        # Cluster 3: Isolated noise far away (3.0, 3.0, 3.0)
+        noise = rng.uniform(-0.05, 0.05, size=(40, 3)) + np.array([3.0, 3.0, 3.0])
+
+        pts = np.vstack([c1, c2, noise])
+        clean_pts, _ = filter_object_pointcloud_dbscan(pts, eps=0.10, min_samples=5, min_cluster_size=20)
+        # Both c1 (150) and c2 (50) should be retained, while noise (40) is pruned
+        self.assertGreaterEqual(len(clean_pts), 180)
+        self.assertTrue(np.all(np.abs(clean_pts) < 1.5))
+
+    def test_missing_detections_raises_filenotfound(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            missing_det = Path(tmp_dir) / "non_existent_det.json"
+            npz_path = Path(tmp_dir) / "raw_depths.npz"
+            np.savez(str(npz_path), dummy=np.array([1]))
+
+            with self.assertRaises(FileNotFoundError):
+                process_object_detections(detections_path=missing_det, raw_depths_path=npz_path)
+
+    def test_missing_raw_depths_raises_filenotfound(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            det_path = Path(tmp_dir) / "detections.json"
+            with open(det_path, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+            missing_npz = Path(tmp_dir) / "non_existent.npz"
+
+            with self.assertRaises(FileNotFoundError):
+                process_object_detections(detections_path=det_path, raw_depths_path=missing_npz)
 
 
 class TestSpatialPhase3MeshPlacer(unittest.TestCase):
@@ -482,6 +654,22 @@ class TestSpatialPhase3MeshPlacer(unittest.TestCase):
             chair_item = summary_dict["obj_2_chair"]
             self.assertEqual(chair_item["placement_type"], "floor")
             self.assertAlmostEqual(chair_item["delta_y_applied"], -0.4, places=4)
+
+    def test_align_empty_objects_dir_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            empty_objs_dir = Path(tmp_dir) / "empty_objects"
+            empty_objs_dir.mkdir()
+            planes_json = Path(tmp_dir) / "planes.json"
+            with open(planes_json, "w", encoding="utf-8") as f:
+                json.dump({"floor": {"mean_y": 0.0}, "tables": [], "walls": []}, f)
+            out_dir = Path(tmp_dir) / "aligned"
+
+            summary = align_and_place_object_meshes(
+                objects_dir=empty_objs_dir,
+                plane_data_path=planes_json,
+                out_dir=out_dir
+            )
+            self.assertEqual(summary, [])
 
 
 if __name__ == "__main__":

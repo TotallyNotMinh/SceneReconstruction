@@ -194,15 +194,13 @@ def align_and_place_object_meshes(
             objects_manifest = json.load(mf)
 
     # Find object mesh files (.ply, .obj)
-    mesh_files = list(objects_dir.glob("*.ply")) + list(objects_dir.glob("*.obj"))
+    mesh_files = [
+        f for f in list(objects_dir.glob("*.ply")) + list(objects_dir.glob("*.obj"))
+        if f.name != "room_layout.obj" and not f.name.endswith(".json")
+    ]
     if not mesh_files:
-        print(f"[MeshPlacer] No object mesh files found in '{objects_dir}'. Creating a test object box...")
-        test_mesh_path = objects_dir / "test_chair.ply"
-        if HAS_TRIMESH:
-            box = trimesh.creation.box(extents=[0.5, 0.8, 0.5])
-            box.apply_translation([0.0, 0.6, 0.0])  # Floating at Y = 0.2m min_y
-            box.export(str(test_mesh_path))
-            mesh_files = [test_mesh_path]
+        print(f"[MeshPlacer] No object mesh files found in '{objects_dir}'. Nothing to align.")
+        return []
 
     print(f"[MeshPlacer] Aligning & Snapping {len(mesh_files)} object meshes onto support planes/walls...")
     aligned_summary: List[Dict[str, Any]] = []

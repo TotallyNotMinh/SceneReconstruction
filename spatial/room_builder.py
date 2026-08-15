@@ -3,9 +3,9 @@
 spatial/room_builder.py — Phase 1: Architectural Plane Detection via RANSAC.
 
 Reads a 3D point cloud (world_pointcloud.ply), extracts dominant planar surfaces
-(Floor, Tabletop/Support surfaces) using RANSAC plane fitting, and exports:
-1. data/processed/room_layout.obj (Visual layout mesh)
-2. data/processed/detected_planes.json (Plane equations ax + by + cz + d = 0 and bounds)
+(Floor, Tabletop, and Vertical Walls) using RANSAC plane fitting, and exports:
+1. data/processed/room_layout.obj (Visual layout mesh with Oriented Bounding Boxes)
+2. data/processed/detected_planes.json (Plane equations ax + by + cz + d = 0 and oriented bounds)
 """
 
 import sys
@@ -35,58 +35,79 @@ except ImportError:
     HAS_TRIMESH = False
 
 
-def _generate_synthetic_room_pcd(out_ply: Path, num_points: int = 10000) -> np.ndarray:
-    """Generate a synthetic room point cloud for testing when no real PLY exists."""
-    print(f"[RoomBuilder] Generating synthetic room point cloud for testing ({num_points} points)...")
-    rng = np.random.default_rng(42)
+def _compute_oriented_wall_geometry(
+    inlier_pts: np.ndarray,
+    normal: np.ndarray,
+    floor_y: float = 0.0,
+    thickness: float = config.WALL_THICKNESS,
+) -> Dict[str, Any]:
+    """
+    Compute Oriented Bounding Box (OBB) parameters for a vertical wall plane.
 
-    # Floor at Y = 0.0, bounds X: [-3, 3], Z: [-3, 3]
-    n_floor = int(num_points * 0.45)
-    floor_x = rng.uniform(-3.0, 3.0, n_floor)
-    floor_z = rng.uniform(-3.0, 3.0, n_floor)
-    floor_y = rng.normal(0.0, 0.01, n_floor)
-    floor_pts = np.column_stack([floor_x, floor_y, floor_z])
-    floor_cols = np.tile([180, 180, 180], (n_floor, 1)).astype(np.uint8)
+    Parameters
+    ----------
+    inlier_pts : (N, 3) points belonging to the wall plane.
+    normal : (3,) unit normal vector of the plane [nx, ny, nz].
+    floor_y : Ground floor level Y coordinate (m).
+    thickness : Wall slab thickness in meters.
 
-    # Vertical Wall at Z = -2.0, bounds X: [-2.5, 2.5], Y: [0.0, 2.5]
-    n_wall = int(num_points * 0.20)
-    wall_x = rng.uniform(-2.5, 2.5, n_wall)
-    wall_y = rng.uniform(0.0, 2.5, n_wall)
-    wall_z = rng.normal(-2.0, 0.008, n_wall)
-    wall_pts = np.column_stack([wall_x, wall_y, wall_z])
-    wall_cols = np.tile([210, 210, 200], (n_wall, 1)).astype(np.uint8)
+    Returns
+    -------
+    Dict containing oriented wall geometry (u_tangent, length, height, center, transform_matrix).
+    """
+    # Project normal to horizontal X-Z plane
+    n_xz = np.array([normal[0], 0.0, normal[2]], dtype=np.float64)
+    norm_len = np.linalg.norm(n_xz)
+    if norm_len < 1e-6:
+        n_xz = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        n_xz = n_xz / norm_len
 
-    # Tabletop at Y = 0.75, bounds X: [-0.8, 0.8], Z: [-0.5, 0.5]
-    n_table = int(num_points * 0.20)
-    table_x = rng.uniform(-0.8, 0.8, n_table)
-    table_z = rng.uniform(-0.5, 0.5, n_table)
-    table_y = rng.normal(0.75, 0.008, n_table)
-    table_pts = np.column_stack([table_x, table_y, table_z])
-    table_cols = np.tile([130, 90, 50], (n_table, 1)).astype(np.uint8)
+    # Horizontal tangent vector u along the wall surface length
+    u_tangent = np.array([-n_xz[2], 0.0, n_xz[0]], dtype=np.float64)
+    v_vertical = np.array([0.0, 1.0, 0.0], dtype=np.float64)
 
-    # Object / Chair clutter points
-    n_obj = num_points - n_floor - n_wall - n_table
-    obj_x = rng.uniform(-1.5, 1.5, n_obj)
-    obj_z = rng.uniform(-1.5, 1.5, n_obj)
-    obj_y = rng.uniform(0.1, 1.2, n_obj)
-    obj_pts = np.column_stack([obj_x, obj_y, obj_z])
-    obj_cols = np.tile([50, 120, 200], (n_obj, 1)).astype(np.uint8)
+    # Ensure right-handed coordinate frame: det([u, v, n]) == +1
+    R_mat = np.column_stack([u_tangent, v_vertical, n_xz])
+    if np.linalg.det(R_mat) < 0:
+        u_tangent = -u_tangent
+        R_mat = np.column_stack([u_tangent, v_vertical, n_xz])
 
-    pts = np.vstack([floor_pts, wall_pts, table_pts, obj_pts])
-    cols = np.vstack([floor_cols, wall_cols, table_cols, obj_cols])
+    # Project inlier points onto horizontal tangent u and normal n_xz
+    u_coords = inlier_pts @ u_tangent
+    n_coords = inlier_pts @ n_xz
+    y_coords = inlier_pts[:, 1]
 
-    out_ply.parent.mkdir(parents=True, exist_ok=True)
-    if HAS_TRIMESH:
-        cloud = trimesh.PointCloud(vertices=pts, colors=cols)
-        cloud.export(str(out_ply))
-    elif HAS_OPEN3D:
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts)
-        pcd.colors = o3d.utility.Vector3dVector(cols / 255.0)
-        o3d.io.write_point_cloud(str(out_ply), pcd)
+    u_min, u_max = float(np.min(u_coords)), float(np.max(u_coords))
+    length = max(0.40, u_max - u_min)
+    u_mid = (u_min + u_max) / 2.0
+    n_mid = float(np.mean(n_coords))
 
-    print(f"[RoomBuilder] Saved synthetic point cloud -> {out_ply}")
-    return pts
+    # Height span: clamp wall base to floor level if points are near floor (<= 0.20m)
+    observed_min_y = float(np.min(y_coords))
+    observed_max_y = float(np.max(y_coords))
+    base_y = floor_y if abs(observed_min_y - floor_y) <= 0.20 else observed_min_y
+    top_y = max(base_y + 0.60, observed_max_y)
+    height = top_y - base_y
+    center_y = base_y + (height / 2.0)
+
+    center_xz = (u_mid * u_tangent) + (n_mid * n_xz)
+    center_3d = np.array([center_xz[0], center_y, center_xz[2]], dtype=np.float64)
+
+    # 4x4 Transformation Matrix
+    T_mat = np.eye(4, dtype=np.float64)
+    T_mat[:3, :3] = R_mat
+    T_mat[:3, 3] = center_3d
+
+    return {
+        "length": length,
+        "height": height,
+        "thickness": thickness,
+        "center": center_3d.tolist(),
+        "u_tangent": u_tangent.tolist(),
+        "normal_xz": n_xz.tolist(),
+        "transform_matrix": T_mat.tolist(),
+    }
 
 
 def detect_architectural_planes(
@@ -94,19 +115,19 @@ def detect_architectural_planes(
     distance_threshold: float = config.RANSAC_DISTANCE_THRESH,
     ransac_n: int = config.RANSAC_N,
     num_iterations: int = config.RANSAC_NUM_ITERATIONS,
-    max_planes: int = 5,
-    min_inliers: int = 100,
+    max_planes: int = 6,
+    min_inliers: int = 150,
     out_obj: Optional[Path | str] = None,
     out_json: Optional[Path | str] = None,
 ) -> Dict[str, Any]:
     """
-    Detect dominant architectural planes (Floor & Tabletop surfaces) using RANSAC.
+    Detect dominant architectural planes (Floor, Tables, Walls) using RANSAC.
 
     Parameters
     ----------
-    ply_path : Path to input point cloud (.ply). If None or missing, auto-generates test data.
+    ply_path : Path to input point cloud (.ply).
     distance_threshold : Max distance in meters for a point to be an inlier of a plane.
-    ransac_n : Number of sampled points to estimate plane equation.
+    ransac_n : Number of sampled points to estimate plane hypothesis.
     num_iterations : Maximum RANSAC iterations.
     max_planes : Maximum number of sequential RANSAC planes to extract.
     min_inliers : Minimum number of points required to form a valid plane.
@@ -115,10 +136,7 @@ def detect_architectural_planes(
 
     Returns
     -------
-    Dict containing:
-      - 'floor': dict with plane equation [a,b,c,d], height, inlier_count, bounds
-      - 'tables': list of dicts for detected tabletop planes
-      - 'all_planes': list of all raw detected RANSAC planes
+    Dict containing detected floor, tables, walls, and all_planes metadata.
     """
     if not HAS_OPEN3D:
         raise ImportError("open3d is required for RANSAC plane fitting. Install via: pip install open3d")
@@ -128,8 +146,10 @@ def detect_architectural_planes(
     ply_path = Path(ply_path)
 
     if not ply_path.exists():
-        print(f"[RoomBuilder] Point cloud file not found: {ply_path}")
-        _generate_synthetic_room_pcd(ply_path)
+        raise FileNotFoundError(
+            f"[RoomBuilder] Point cloud file not found: {ply_path}\n"
+            "              Please run Stage 1 (pointcloud_builder.py) first to generate world_pointcloud.ply."
+        )
 
     print(f"[RoomBuilder] Loading point cloud for RANSAC plane detection: '{ply_path.name}'...")
     pcd = o3d.io.read_point_cloud(str(ply_path))
@@ -182,6 +202,7 @@ def detect_architectural_planes(
             "is_horizontal": bool(is_horizontal),
             "is_vertical": bool(is_vertical),
             "inlier_count": int(len(inliers)),
+            "inlier_pts": inlier_pts,
             "min_bound": min_b,
             "max_bound": max_b,
         })
@@ -190,48 +211,84 @@ def detect_architectural_planes(
         print("[RoomBuilder] WARNING: No RANSAC planes were detected.")
         return {"floor": None, "tables": [], "walls": [], "all_planes": []}
 
-    # Filter horizontal planes to separate Floor vs Tabletop
+    # Separate horizontal planes (Floor & Tabletop)
     horizontal_planes = [p for p in raw_planes if p["is_horizontal"]]
     if not horizontal_planes:
-        # Fallback: exclude known vertical planes, use the rest sorted by Y height
         horizontal_planes = sorted(
             [p for p in raw_planes if not p.get("is_vertical", False)],
             key=lambda p: p["mean_y"]
         )
         if not horizontal_planes:
-            # Total fallback — use all planes, accept inaccurate result
             horizontal_planes = sorted(raw_planes, key=lambda p: p["mean_y"])
             print("[RoomBuilder] WARNING: All RANSAC planes appear vertical — floor detection may be inaccurate.")
 
-    # Floor identification: Among the lowest horizontal planes (bottom 40% height range or lowest 3),
-    # pick the plane with the largest inlier count (dominant support surface)
+    # Floor identification: Select dominant support surface among the lowest horizontal planes
     horizontal_planes.sort(key=lambda p: p["mean_y"])
     lowest_y = horizontal_planes[0]["mean_y"]
-    floor_candidates = [p for p in horizontal_planes if (p["mean_y"] - lowest_y) <= 0.20]
+    floor_candidates = [p for p in horizontal_planes if (p["mean_y"] - lowest_y) <= 0.25]
     floor_plane = max(floor_candidates, key=lambda p: p["inlier_count"])
+    floor_y = float(floor_plane["mean_y"])
 
     # Table planes: Horizontal planes at least 0.25m above the floor level
     table_planes = [
         p for p in horizontal_planes
-        if (p["mean_y"] - floor_plane["mean_y"]) >= 0.25
+        if (p["mean_y"] - floor_y) >= 0.25
     ]
 
-    # Wall planes: Vertical planes
-    wall_planes = [p for p in raw_planes if p.get("is_vertical", False)]
+    # Wall planes: Vertical planes with sufficient inliers
+    min_wall_inliers = getattr(config, "ROOM_MIN_WALL_INLIERS", 250)
+    raw_wall_planes = [
+        p for p in raw_planes
+        if p.get("is_vertical", False) and p["inlier_count"] >= min_wall_inliers
+    ]
+
+    # Compute Oriented Bounding Box geometry for each wall plane
+    wall_planes: List[Dict[str, Any]] = []
+    for wp in raw_wall_planes:
+        inlier_pts = wp["inlier_pts"]
+        norm = np.array(wp["normal"], dtype=np.float64)
+        obb_meta = _compute_oriented_wall_geometry(inlier_pts, norm, floor_y=floor_y)
+        wp_clean = {
+            "id": wp["id"],
+            "equation": wp["equation"],
+            "normal": wp["normal"],
+            "mean_y": wp["mean_y"],
+            "inlier_count": wp["inlier_count"],
+            "min_bound": wp["min_bound"],
+            "max_bound": wp["max_bound"],
+            "oriented_box": obb_meta,
+        }
+        wall_planes.append(wp_clean)
+
+    # Clean inlier_pts from raw_planes before export
+    all_planes_clean = []
+    for p in raw_planes:
+        p_copy = dict(p)
+        p_copy.pop("inlier_pts", None)
+        all_planes_clean.append(p_copy)
+
+    floor_clean = dict(floor_plane)
+    floor_clean.pop("inlier_pts", None)
+
+    tables_clean = []
+    for tp in table_planes:
+        tp_copy = dict(tp)
+        tp_copy.pop("inlier_pts", None)
+        tables_clean.append(tp_copy)
 
     print(f"[RoomBuilder] RANSAC Plane Detection complete:")
-    print(f"             - Floor Plane Detected  : Y = {floor_plane['mean_y']:.3f}m (Inliers: {floor_plane['inlier_count']:,})")
-    for t_idx, tp in enumerate(table_planes):
+    print(f"             - Floor Plane Detected  : Y = {floor_y:.3f}m (Inliers: {floor_plane['inlier_count']:,})")
+    for t_idx, tp in enumerate(tables_clean):
         print(f"             - Tabletop Plane #{t_idx+1}      : Y = {tp['mean_y']:.3f}m (Inliers: {tp['inlier_count']:,})")
     for w_idx, wp in enumerate(wall_planes):
-        print(f"             - Wall Plane #{w_idx+1}          : Normal = {wp['normal']} (Inliers: {wp['inlier_count']:,})")
+        obb = wp["oriented_box"]
+        print(f"             - Wall Plane #{w_idx+1} (Oriented): Length={obb['length']:.2f}m, Height={obb['height']:.2f}m, Normal={wp['normal']}")
 
-    # Export detected plane JSON metadata
     result = {
-        "floor": floor_plane,
-        "tables": table_planes,
+        "floor": floor_clean,
+        "tables": tables_clean,
         "walls": wall_planes,
-        "all_planes": raw_planes,
+        "all_planes": all_planes_clean,
     }
 
     if out_json is None:
@@ -243,7 +300,7 @@ def detect_architectural_planes(
         json.dump(result, f, indent=2)
     print(f"[RoomBuilder] Plane metadata saved -> {out_json}")
 
-    # Generate 3D visual layout mesh for Floor and Tables (.obj)
+    # Generate visual layout mesh (.obj)
     if out_obj is None:
         out_obj = config.PROCESSED_DATA_DIR / "room_layout.obj"
     out_obj = Path(out_obj)
@@ -255,7 +312,7 @@ def detect_architectural_planes(
 
 
 def _export_room_layout_mesh(plane_data: Dict[str, Any], out_obj: Path):
-    """Create lightweight box meshes for Floor and Table surfaces for visualization."""
+    """Create lightweight oriented box meshes for Floor, Tables, and Walls for visualization."""
     if not HAS_TRIMESH and not HAS_OPEN3D:
         print("[RoomBuilder] Neither trimesh nor open3d available; skipping layout mesh export.")
         return
@@ -297,23 +354,24 @@ def _export_room_layout_mesh(plane_data: Dict[str, Any], out_obj: Path):
 
         walls = plane_data.get("walls", [])
         for wp in walls:
-            min_b = wp["min_bound"]
-            max_b = wp["max_bound"]
-            size_x = max(0.05, max_b[0] - min_b[0])
-            size_y = max(0.5, max_b[1] - min_b[1])
-            size_z = max(0.05, max_b[2] - min_b[2])
-            box = trimesh.creation.box(extents=[size_x, size_y, size_z])
-            center_x = (min_b[0] + max_b[0]) / 2.0
-            center_y = (min_b[1] + max_b[1]) / 2.0
-            center_z = (min_b[2] + max_b[2]) / 2.0
-            box.apply_translation([center_x, center_y, center_z])
-            box.visual.vertex_colors = np.tile([180, 180, 100, 220], (len(box.vertices), 1)).astype(np.uint8)
-            meshes.append(box)
+            obb = wp.get("oriented_box")
+            if obb:
+                length = obb["length"]
+                height = obb["height"]
+                thickness = obb.get("thickness", config.WALL_THICKNESS)
+                T_mat = np.array(obb["transform_matrix"], dtype=np.float64)
+
+                # Oriented box centered at origin with local axes (Length: X, Height: Y, Thickness: Z)
+                wall_box = trimesh.creation.box(extents=[length, height, thickness])
+                wall_box.apply_transform(T_mat)
+                wall_box.visual.vertex_colors = np.tile([180, 180, 100, 220], (len(wall_box.vertices), 1)).astype(np.uint8)
+                meshes.append(wall_box)
 
         if meshes:
             combined = trimesh.util.concatenate(meshes)
             combined.export(str(out_obj))
-            print(f"[RoomBuilder] Visual room layout mesh exported -> {out_obj}")
+            print(f"[RoomBuilder] Visual room layout mesh (OBB Oriented) exported -> {out_obj}")
+
     elif HAS_OPEN3D:
         combined_o3d = o3d.geometry.TriangleMesh()
         floor = plane_data.get("floor")
@@ -330,6 +388,22 @@ def _export_room_layout_mesh(plane_data: Dict[str, Any], out_obj: Path):
             box.translate([center_x, center_y, center_z])
             box.paint_uniform_color([0.78, 0.27, 0.27])
             combined_o3d += box
+
+        walls = plane_data.get("walls", [])
+        for wp in walls:
+            obb = wp.get("oriented_box")
+            if obb:
+                length = obb["length"]
+                height = obb["height"]
+                thickness = obb.get("thickness", config.WALL_THICKNESS)
+                T_mat = np.array(obb["transform_matrix"], dtype=np.float64)
+
+                wall_box = o3d.geometry.TriangleMesh.create_box(width=length, height=height, depth=thickness)
+                # Center Open3D box at origin
+                wall_box.translate([-length / 2.0, -height / 2.0, -thickness / 2.0])
+                wall_box.transform(T_mat)
+                wall_box.paint_uniform_color([0.70, 0.70, 0.40])
+                combined_o3d += wall_box
 
         if len(combined_o3d.vertices) > 0:
             o3d.io.write_triangle_mesh(str(out_obj), combined_o3d)
@@ -360,8 +434,8 @@ if __name__ == "__main__":
                         help="Input .ply point cloud file")
     parser.add_argument("--distance-thresh", type=float, default=config.RANSAC_DISTANCE_THRESH,
                         help="Max distance threshold for plane inliers in meters (default: 0.03)")
-    parser.add_argument("--max-planes", type=int, default=5,
-                        help="Max RANSAC planes to extract (default: 5)")
+    parser.add_argument("--max-planes", type=int, default=6,
+                        help="Max RANSAC planes to extract (default: 6)")
     parser.add_argument("--out-obj", type=str, default=str(config.PROCESSED_DATA_DIR / "room_layout.obj"),
                         help="Output path for layout mesh .obj file")
     args = parser.parse_args()

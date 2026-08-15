@@ -52,9 +52,9 @@ FSV_VIOLATION_RATIO    = 0.20  # Ratio threshold for free-space violation filter
 
 # ── ObjectEstimator: Back-projection & Clustering ────────────────────────────
 ENABLE_DBSCAN           = False # Enable DBSCAN cluster outlier removal
-DBSCAN_EPS              = 0.05  # DBSCAN neighbourhood radius (m)
-DBSCAN_MIN_SAMPLES      = 10    # Minimum points to form a cluster
-DBSCAN_MIN_CLUSTER_SIZE = 50    # Minimum cluster size to keep
+DBSCAN_EPS              = 0.08  # DBSCAN neighbourhood radius (m)
+DBSCAN_MIN_SAMPLES      = 5     # Minimum points to form a cluster
+DBSCAN_MIN_CLUSTER_SIZE = 30    # Minimum cluster size to keep
 OCCLUSION_MIN_CONSENSUS = 0.60  # Fraction of views a point must be visible in
 
 # ── RoomBuilder & RANSAC Plane Detection ──────────────────────────────────────
@@ -65,7 +65,12 @@ ROOM_FLOOR_NORMAL_TOLERANCE = 0.85   # Min abs(dot(normal, gravity_up)) to quali
 ROOM_WALL_NORMAL_TOLERANCE  = 0.25   # Max abs(dot(normal, gravity_up)) to qualify as vertical wall plane
 
 # ── ObjectEstimator & 3D Surface Meshing ─────────────────────────────────────
-ALPHA_SHAPE_ALPHA           = 0.10   # Alpha-Shape concavity parameter for 3D mesh surface generation (m)
+ALPHA_SHAPE_ALPHA              = 0.10   # Alpha-Shape concavity parameter for 3D mesh surface generation (m)
+OBJECT_DEPTH_FOREGROUND_MARGIN = 0.35   # Max depth delta beyond median object depth to prune background bleed (m)
+
+# ── RoomBuilder & Wall Meshing ───────────────────────────────────────────────
+WALL_THICKNESS                 = 0.05   # Thickness of generated wall slab meshes in meters
+ROOM_MIN_WALL_INLIERS          = 250    # Minimum inlier points required to qualify as an architectural wall plane
 
 # ── MeshPlacer & Surface / Wall Snapping ─────────────────────────────────────
 SURFACE_SNAPPING_MARGIN     = 0.00   # Vertical offset margin when snapping mesh bottom to surface (m)
