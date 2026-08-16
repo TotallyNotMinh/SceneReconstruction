@@ -115,13 +115,13 @@ def detect_architectural_planes(
     distance_threshold: float = config.RANSAC_DISTANCE_THRESH,
     ransac_n: int = config.RANSAC_N,
     num_iterations: int = config.RANSAC_NUM_ITERATIONS,
-    max_planes: int = 6,
+    max_planes: int = getattr(config, "RANSAC_MAX_PLANES", 12),
     min_inliers: int = 150,
     out_obj: Optional[Path | str] = None,
     out_json: Optional[Path | str] = None,
 ) -> Dict[str, Any]:
     """
-    Detect dominant architectural planes (Floor, Tables, Walls) using RANSAC.
+    Detect dominant architectural planes (Floor, Tables, Walls, Ceilings) using RANSAC.
 
     Parameters
     ----------
@@ -136,7 +136,7 @@ def detect_architectural_planes(
 
     Returns
     -------
-    Dict containing detected floor, tables, walls, and all_planes metadata.
+    Dict containing detected floor, tables, walls, ceilings, and all_planes metadata.
     """
     if not HAS_OPEN3D:
         raise ImportError("open3d is required for RANSAC plane fitting. Install via: pip install open3d")
@@ -192,7 +192,7 @@ def detect_architectural_planes(
 
         # Check if plane is horizontal (normal vector aligned with Y axis) or vertical (normal in X-Z plane)
         is_horizontal = abs(normal[1]) >= config.ROOM_FLOOR_NORMAL_TOLERANCE
-        is_vertical = abs(normal[1]) <= config.ROOM_WALL_NORMAL_TOLERANCE
+        is_vertical = (not is_horizontal) and (abs(normal[1]) <= config.ROOM_WALL_NORMAL_TOLERANCE)
 
         raw_planes.append({
             "id": idx,
@@ -209,9 +209,9 @@ def detect_architectural_planes(
 
     if not raw_planes:
         print("[RoomBuilder] WARNING: No RANSAC planes were detected.")
-        return {"floor": None, "tables": [], "walls": [], "all_planes": []}
+        return {"floor": None, "tables": [], "walls": [], "ceilings": [], "all_planes": []}
 
-    # Separate horizontal planes (Floor & Tabletop)
+    # Separate horizontal planes (Floor & Tabletop & Ceiling)
     horizontal_planes = [p for p in raw_planes if p["is_horizontal"]]
     if not horizontal_planes:
         horizontal_planes = sorted(
@@ -229,10 +229,18 @@ def detect_architectural_planes(
     floor_plane = max(floor_candidates, key=lambda p: p["inlier_count"])
     floor_y = float(floor_plane["mean_y"])
 
-    # Table planes: Horizontal planes at least 0.25m above the floor level
+    # Table planes: Horizontal planes within standard architectural furniture height above floor level
+    min_table_h = getattr(config, "TABLE_MIN_HEIGHT", 0.30)
+    max_table_h = getattr(config, "TABLE_MAX_HEIGHT", 1.40)
     table_planes = [
         p for p in horizontal_planes
-        if (p["mean_y"] - floor_y) >= 0.25
+        if min_table_h <= (p["mean_y"] - floor_y) <= max_table_h
+    ]
+
+    # Ceiling planes: Horizontal planes high above the floor (higher than tabletop range)
+    ceiling_planes = [
+        p for p in horizontal_planes
+        if (p["mean_y"] - floor_y) > max_table_h
     ]
 
     # Wall planes: Vertical planes with sufficient inliers
@@ -276,10 +284,18 @@ def detect_architectural_planes(
         tp_copy.pop("inlier_pts", None)
         tables_clean.append(tp_copy)
 
+    ceilings_clean = []
+    for cp in ceiling_planes:
+        cp_copy = dict(cp)
+        cp_copy.pop("inlier_pts", None)
+        ceilings_clean.append(cp_copy)
+
     print(f"[RoomBuilder] RANSAC Plane Detection complete:")
     print(f"             - Floor Plane Detected  : Y = {floor_y:.3f}m (Inliers: {floor_plane['inlier_count']:,})")
     for t_idx, tp in enumerate(tables_clean):
         print(f"             - Tabletop Plane #{t_idx+1}      : Y = {tp['mean_y']:.3f}m (Inliers: {tp['inlier_count']:,})")
+    for c_idx, cp in enumerate(ceilings_clean):
+        print(f"             - Ceiling Plane #{c_idx+1}       : Y = {cp['mean_y']:.3f}m (Inliers: {cp['inlier_count']:,})")
     for w_idx, wp in enumerate(wall_planes):
         obb = wp["oriented_box"]
         print(f"             - Wall Plane #{w_idx+1} (Oriented): Length={obb['length']:.2f}m, Height={obb['height']:.2f}m, Normal={wp['normal']}")
@@ -287,6 +303,7 @@ def detect_architectural_planes(
     result = {
         "floor": floor_clean,
         "tables": tables_clean,
+        "ceilings": ceilings_clean,
         "walls": wall_planes,
         "all_planes": all_planes_clean,
     }
@@ -434,8 +451,8 @@ if __name__ == "__main__":
                         help="Input .ply point cloud file")
     parser.add_argument("--distance-thresh", type=float, default=config.RANSAC_DISTANCE_THRESH,
                         help="Max distance threshold for plane inliers in meters (default: 0.03)")
-    parser.add_argument("--max-planes", type=int, default=6,
-                        help="Max RANSAC planes to extract (default: 6)")
+    parser.add_argument("--max-planes", type=int, default=getattr(config, "RANSAC_MAX_PLANES", 12),
+                        help="Max RANSAC planes to extract (default: 12)")
     parser.add_argument("--out-obj", type=str, default=str(config.PROCESSED_DATA_DIR / "room_layout.obj"),
                         help="Output path for layout mesh .obj file")
     args = parser.parse_args()

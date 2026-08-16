@@ -239,6 +239,7 @@ def align_and_place_object_meshes(
             continue
 
         obj_min_y = float(verts[:, 1].min())
+        obj_max_y = float(verts[:, 1].max())
         obj_min_x = float(verts[:, 0].min())
         obj_max_x = float(verts[:, 0].max())
         obj_min_z = float(verts[:, 2].min())
@@ -247,7 +248,35 @@ def align_and_place_object_meshes(
         obj_center_y = float(verts[:, 1].mean())
         obj_center_z = (obj_min_z + obj_max_z) / 2.0
 
-        if is_wall_mounted:
+        # Check if object is directly resting on a detected tabletop plane
+        matching_table_y = None
+        for tp in table_planes:
+            t_y = float(tp.get("mean_y", 0.0))
+            min_b = tp.get("min_bound", [-1e5, t_y, -1e5])
+            max_b = tp.get("max_bound", [1e5, t_y, 1e5])
+
+            # Check horizontal footprint overlap with margin
+            margin_h = 0.25
+            in_x = (min_b[0] - margin_h) <= obj_center_x <= (max_b[0] + margin_h)
+            in_z = (min_b[2] - margin_h) <= obj_center_z <= (max_b[2] + margin_h)
+
+            # Robust condition:
+            # 1. Object bottom is reasonably near tabletop (>= t_y - 0.35m)
+            # 2. Object center or top is at or above tabletop
+            is_above_table = (obj_min_y >= t_y - 0.35) and ((obj_center_y >= t_y - 0.10) or (obj_max_y > t_y))
+            if in_x and in_z and is_above_table:
+                if matching_table_y is None or t_y > matching_table_y:
+                    matching_table_y = t_y
+
+        # If object is wall-mounted type (e.g. TV / monitor / picture):
+        # If it is situated right on top of a table (like a desktop monitor or tabletop TV), snap to table.
+        # Otherwise, snap to nearest vertical wall plane.
+        is_mounted_on_wall = is_wall_mounted and (
+            matching_table_y is None
+            or obj_min_y > matching_table_y + 0.35
+            or obj_center_y > matching_table_y + 0.85
+        )
+        if is_mounted_on_wall:
             # Wall-mounted object: Snap horizontally to nearest vertical wall plane, keep Y elevation
             if wall_planes:
                 _cx, _cy, _cz = obj_center_x, obj_center_y, obj_center_z
@@ -272,22 +301,7 @@ def align_and_place_object_meshes(
                 delta_y = 0.0
         else:
             # Floor / Tabletop supported object: Snap vertically to surface beneath object
-            candidate_support_y = [floor_y]
-            for tp in table_planes:
-                t_y = float(tp.get("mean_y", 0.0))
-                min_b = tp.get("min_bound", [-1e5, t_y, -1e5])
-                max_b = tp.get("max_bound", [1e5, t_y, 1e5])
-
-                # Check horizontal footprint overlap with margin
-                margin_h = 0.20
-                in_x = (min_b[0] - margin_h) <= obj_center_x <= (max_b[0] + margin_h)
-                in_z = (min_b[2] - margin_h) <= obj_center_z <= (max_b[2] + margin_h)
-
-                # Object base must be reasonably above the table surface
-                if in_x and in_z and (obj_min_y >= t_y - 0.20):
-                    candidate_support_y.append(t_y)
-
-            target_surface_y = max(candidate_support_y)
+            target_surface_y = matching_table_y if matching_table_y is not None else floor_y
             snapped_mesh, delta_y = snap_mesh_to_surface(mesh, surface_y=target_surface_y)
             delta_vec = [0.0, delta_y, 0.0]
             placement_type = "table" if target_surface_y > (floor_y + 0.10) else "floor"

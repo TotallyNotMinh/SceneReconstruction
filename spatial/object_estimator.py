@@ -231,13 +231,110 @@ def reconstruct_object_mesh_alpha_shape(
     return mesh_o3d
 
 
+def _build_2d_mask(view: Dict[str, Any], H: int, W: int) -> np.ndarray:
+    """Build binary 2D mask from polygon or bounding box."""
+    mask_2d = np.zeros((H, W), dtype=np.uint8)
+    if "mask" in view and isinstance(view["mask"], (list, np.ndarray)) and len(view["mask"]) >= 3:
+        raw_mask = np.array(view["mask"], dtype=np.int32)
+        if raw_mask.ndim == 1:
+            poly_pts = raw_mask.reshape(-1, 1, 2)
+        elif raw_mask.ndim == 2 and raw_mask.shape[1] == 2:
+            poly_pts = raw_mask.reshape(-1, 1, 2)
+        else:
+            poly_pts = raw_mask.astype(np.int32)
+        cv2.fillPoly(mask_2d, [poly_pts], 255)
+    else:
+        bbox = view.get("bbox", [0, 0, W, H])
+        xmin, ymin, xmax, ymax = map(int, bbox)
+        mask_2d[max(0, ymin):min(H, ymax), max(0, xmin):min(W, xmax)] = 255
+    return mask_2d
+
+
+def extract_object_points_from_world_pcd_view(
+    world_pts: np.ndarray,
+    world_cols: Optional[np.ndarray],
+    mask_2d: np.ndarray,
+    K: np.ndarray,
+    c2w: np.ndarray,
+    foreground_margin: float = config.OBJECT_DEPTH_FOREGROUND_MARGIN,
+) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+    """
+    Project 3D world points onto a 2D camera view and select points falling inside the 2D mask.
+
+    Parameters
+    ----------
+    world_pts : (N, 3) float64 array of world-space points.
+    world_cols : Optional (N, 3) uint8 RGB colors.
+    mask_2d : (H, W) uint8 binary mask.
+    K : (3, 3) intrinsic matrix.
+    c2w : (4, 4) camera-to-world pose matrix.
+    foreground_margin : Max depth beyond median to prune background points.
+
+    Returns
+    -------
+    (selected_pts [M, 3], selected_cols [M, 3], inlier_indices [M])
+    """
+    if len(world_pts) == 0:
+        return np.zeros((0, 3)), None, np.zeros(0, dtype=int)
+
+    H, W = mask_2d.shape[:2]
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    # Transform world points to camera space
+    try:
+        w2c = np.linalg.inv(c2w)
+    except np.linalg.LinAlgError:
+        w2c = np.linalg.pinv(c2w)
+    pts_h = np.hstack([world_pts, np.ones((len(world_pts), 1), dtype=np.float64)])
+    pts_cam = (w2c @ pts_h.T).T[:, :3]
+
+    Z_c = pts_cam[:, 2]
+    # Filter points strictly in front of the camera
+    front_mask = Z_c > 0.1
+    if not np.any(front_mask):
+        return np.zeros((0, 3)), None, np.zeros(0, dtype=int)
+
+    # Perspective projection
+    u = np.round((pts_cam[:, 0] * fx / np.maximum(Z_c, 1e-6)) + cx).astype(np.int64)
+    v = np.round((pts_cam[:, 1] * fy / np.maximum(Z_c, 1e-6)) + cy).astype(np.int64)
+
+    # Check bounds
+    in_bounds = front_mask & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    if not np.any(in_bounds):
+        return np.zeros((0, 3)), None, np.zeros(0, dtype=int)
+
+    valid_idx = np.where(in_bounds)[0]
+    in_mask_subset = mask_2d[v[valid_idx], u[valid_idx]] > 0
+    matched_idx = valid_idx[in_mask_subset]
+
+    if len(matched_idx) == 0:
+        return np.zeros((0, 3)), None, np.zeros(0, dtype=int)
+
+    # Foreground Depth Gating: Prune background surfaces behind the foreground object
+    if foreground_margin > 0 and len(matched_idx) > 10:
+        matched_z = Z_c[matched_idx]
+        median_z = float(np.median(matched_z))
+        fg_mask = matched_z <= (median_z + foreground_margin)
+        matched_idx = matched_idx[fg_mask]
+
+    selected_pts = world_pts[matched_idx]
+    selected_cols = world_cols[matched_idx] if world_cols is not None else None
+    return selected_pts, selected_cols, matched_idx
+
+
 def process_object_detections(
     detections_path: Optional[Path | str] = None,
     raw_depths_path: Optional[Path | str] = None,
     ar_metadata_path: Optional[Path | str] = None,
+    world_pcd_path: Optional[Path | str] = None,
     out_dir: Optional[Path | str] = None,
 ) -> Dict[str, Any]:
-    """Process object detections and reconstruct individual 3D meshes."""
+    """
+    Process object detections and reconstruct individual 3D meshes.
+    Prioritizes extracting points directly from world_pointcloud.ply via 2D-guided Forward Projection,
+    with automatic fallback to multi-view back-projection from raw_depths.npz.
+    """
     if detections_path is None:
         detections_path = config.PROCESSED_DATA_DIR / "detections.json"
     detections_path = Path(detections_path)
@@ -262,6 +359,10 @@ def process_object_detections(
         ar_metadata_path = config.PROCESSED_DATA_DIR / "ar_metadata.json"
     ar_metadata_path = Path(ar_metadata_path)
 
+    if world_pcd_path is None:
+        world_pcd_path = config.PROCESSED_DATA_DIR / "world_pointcloud.ply"
+    world_pcd_path = Path(world_pcd_path)
+
     if out_dir is None:
         out_dir = config.PROCESSED_DATA_DIR / "objects"
     out_dir = Path(out_dir)
@@ -279,6 +380,50 @@ def process_object_detections(
             meta = json.load(mf)
         frames_meta = {f["index"]: f for f in meta.get("frames", [])}
 
+    # Check if we should extract directly from world_pointcloud.ply
+    use_world_pcd = getattr(config, "OBJECT_EXTRACT_FROM_WORLD_PCD", True) and world_pcd_path.exists()
+    world_pts = None
+    world_cols = None
+
+    if use_world_pcd:
+        print(f"[ObjectEstimator] Extracting 3D object point clouds directly from '{world_pcd_path.name}'...")
+        if HAS_TRIMESH:
+            try:
+                cloud = trimesh.load(str(world_pcd_path))
+                if isinstance(cloud, trimesh.Scene):
+                    all_v = [np.asarray(g.vertices, dtype=np.float64) for g in cloud.geometry.values() if hasattr(g, "vertices") and len(g.vertices) > 0]
+                    if all_v:
+                        world_pts = np.vstack(all_v)
+                    all_c = [np.asarray(g.colors)[:, :3].astype(np.uint8) for g in cloud.geometry.values() if hasattr(g, "colors") and g.colors is not None and len(g.colors) == len(g.vertices)]
+                    if len(all_c) == len(all_v) and len(all_c) > 0:
+                        world_cols = np.vstack(all_c)
+                elif isinstance(cloud, trimesh.PointCloud):
+                    world_pts = np.asarray(cloud.vertices, dtype=np.float64)
+                    if hasattr(cloud, "colors") and cloud.colors is not None and len(cloud.colors) > 0:
+                        world_cols = np.asarray(cloud.colors)[:, :3].astype(np.uint8)
+                elif isinstance(cloud, trimesh.Trimesh):
+                    world_pts = np.asarray(cloud.vertices, dtype=np.float64)
+                    if hasattr(cloud.visual, "vertex_colors") and cloud.visual.vertex_colors is not None:
+                        world_cols = np.asarray(cloud.visual.vertex_colors)[:, :3].astype(np.uint8)
+            except Exception as e:
+                world_pts = None
+
+        # Fallback to Open3D if trimesh failed or returned 0 points
+        if (world_pts is None or len(world_pts) == 0) and HAS_OPEN3D:
+            try:
+                pcd = o3d.io.read_point_cloud(str(world_pcd_path))
+                if len(pcd.points) > 0:
+                    world_pts = np.asarray(pcd.points, dtype=np.float64)
+                    world_cols = (np.asarray(pcd.colors) * 255).astype(np.uint8) if pcd.has_colors() else None
+            except Exception as e:
+                pass
+
+        if world_pts is None or len(world_pts) == 0:
+            print("[ObjectEstimator] WARNING: Could not load world point cloud; falling back to depth back-projection.")
+            use_world_pcd = False
+        else:
+            print(f"[ObjectEstimator] Loaded {len(world_pts):,} points from world point cloud.")
+
     reconstructed_objects: Dict[str, Any] = {}
 
     for obj_id, obj_info in detections.items():
@@ -289,6 +434,7 @@ def process_object_detections(
 
         all_obj_pts: List[np.ndarray] = []
         all_obj_cols: List[np.ndarray] = []
+        matched_indices_list: List[np.ndarray] = []
 
         for view in views:
             f_idx = view.get("frame_index", 0)
@@ -317,39 +463,42 @@ def process_object_detections(
             else:
                 c2w = np.eye(4, dtype=np.float64)
 
-            rgb_img = npz[f"rgb_{f_idx}"] if f"rgb_{f_idx}" in npz else None
+            mask_2d = _build_2d_mask(view, H, W)
 
-            # Build binary mask: Check for precise polygon segmentation mask first, fallback to BBox
-            mask_2d = np.zeros((H, W), dtype=np.uint8)
-            if "mask" in view and isinstance(view["mask"], (list, np.ndarray)) and len(view["mask"]) >= 3:
-                raw_mask = np.array(view["mask"], dtype=np.int32)
-                if raw_mask.ndim == 1:
-                    poly_pts = raw_mask.reshape(-1, 1, 2)
-                elif raw_mask.ndim == 2 and raw_mask.shape[1] == 2:
-                    poly_pts = raw_mask.reshape(-1, 1, 2)
-                else:
-                    poly_pts = raw_mask.astype(np.int32)
-                cv2.fillPoly(mask_2d, [poly_pts], 255)
+            if use_world_pcd and world_pts is not None:
+                # 2D-guided 3D point cloud extraction
+                sel_pts, sel_cols, m_idx = extract_object_points_from_world_pcd_view(
+                    world_pts, world_cols, mask_2d, K, c2w
+                )
+                if len(m_idx) > 0:
+                    matched_indices_list.append(m_idx)
             else:
-                bbox = view.get("bbox", [0, 0, W, H])
-                xmin, ymin, xmax, ymax = map(int, bbox)
-                mask_2d[max(0, ymin):min(H, ymax), max(0, xmin):min(W, xmax)] = 255
+                # Fallback: depth back-projection
+                rgb_img = npz[f"rgb_{f_idx}"] if f"rgb_{f_idx}" in npz else None
+                pts_w, cols_w = backproject_mask_to_3d(mask_2d, depth_map, K, c2w, rgb_img=rgb_img)
+                if len(pts_w) > 0:
+                    all_obj_pts.append(pts_w)
+                    if cols_w is not None:
+                        all_obj_cols.append(cols_w)
 
-            pts_w, cols_w = backproject_mask_to_3d(mask_2d, depth_map, K, c2w, rgb_img=rgb_img)
-            if len(pts_w) > 0:
-                all_obj_pts.append(pts_w)
-                if cols_w is not None:
-                    all_obj_cols.append(cols_w)
-
-        if not all_obj_pts:
-            print(f"[ObjectEstimator] WARNING: Object '{obj_id}' ({label}) has 0 valid back-projected 3D points; skipping.")
+        if use_world_pcd and matched_indices_list:
+            # Combine unique indices extracted across views
+            merged_idx = np.unique(np.concatenate(matched_indices_list))
+            concat_pts = world_pts[merged_idx]
+            concat_cols = world_cols[merged_idx] if world_cols is not None else None
+        elif all_obj_pts:
+            concat_pts = np.vstack(all_obj_pts)
+            concat_cols = np.vstack(all_obj_cols) if all_obj_cols else None
+        else:
+            print(f"[ObjectEstimator] WARNING: Object '{obj_id}' ({label}) has 0 valid 3D points; skipping.")
             continue
 
-        concat_pts = np.vstack(all_obj_pts)
-        concat_cols = np.vstack(all_obj_cols) if all_obj_cols else None
+        # Apply DBSCAN Outlier Removal & Dominant Cluster Isolation if enabled
+        if getattr(config, "ENABLE_DBSCAN", True):
+            clean_pts, clean_cols = filter_object_pointcloud_dbscan(concat_pts, concat_cols)
+        else:
+            clean_pts, clean_cols = concat_pts, concat_cols
 
-        # Apply DBSCAN Outlier Removal & Dominant Cluster Isolation
-        clean_pts, clean_cols = filter_object_pointcloud_dbscan(concat_pts, concat_cols)
         if clean_pts is None or len(clean_pts) < 4:
             print(f"[ObjectEstimator] WARNING: Object '{obj_id}' ({label}) has insufficient 3D points ({len(clean_pts) if clean_pts is not None else 0}) after DBSCAN; skipping.")
             continue
@@ -377,12 +526,22 @@ def process_object_detections(
 class ObjectEstimator:
     """Class wrapper for Object 3D Reconstruction."""
 
-    def __init__(self, detections_path: Optional[Path | str] = None, raw_depths_path: Optional[Path | str] = None):
+    def __init__(
+        self,
+        detections_path: Optional[Path | str] = None,
+        raw_depths_path: Optional[Path | str] = None,
+        world_pcd_path: Optional[Path | str] = None,
+    ):
         self.detections_path = Path(detections_path) if detections_path else config.PROCESSED_DATA_DIR / "detections.json"
         self.raw_depths_path = Path(raw_depths_path) if raw_depths_path else config.PROCESSED_DATA_DIR / "raw_depths.npz"
+        self.world_pcd_path = Path(world_pcd_path) if world_pcd_path else config.PROCESSED_DATA_DIR / "world_pointcloud.ply"
 
     def run(self) -> Dict[str, Any]:
-        return process_object_detections(self.detections_path, raw_depths_path=self.raw_depths_path)
+        return process_object_detections(
+            self.detections_path,
+            raw_depths_path=self.raw_depths_path,
+            world_pcd_path=self.world_pcd_path,
+        )
 
 
 if __name__ == "__main__":
@@ -391,8 +550,15 @@ if __name__ == "__main__":
                         help="Path to detections.json file")
     parser.add_argument("--depths", type=str, default=str(config.PROCESSED_DATA_DIR / "raw_depths.npz"),
                         help="Path to raw_depths.npz file")
+    parser.add_argument("--world-pcd", type=str, default=str(config.PROCESSED_DATA_DIR / "world_pointcloud.ply"),
+                        help="Path to world_pointcloud.ply file")
     parser.add_argument("--out-dir", type=str, default=str(config.PROCESSED_DATA_DIR / "objects"),
                         help="Output directory for reconstructed object 3D meshes")
     args = parser.parse_args()
 
-    process_object_detections(detections_path=args.detections, raw_depths_path=args.depths, out_dir=args.out_dir)
+    process_object_detections(
+        detections_path=args.detections,
+        raw_depths_path=args.depths,
+        world_pcd_path=args.world_pcd,
+        out_dir=args.out_dir,
+    )

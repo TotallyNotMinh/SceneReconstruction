@@ -51,7 +51,7 @@ FSV_VIOLATION_RATIO    = 0.20  # Ratio threshold for free-space violation filter
 
 
 # ── ObjectEstimator: Back-projection & Clustering ────────────────────────────
-ENABLE_DBSCAN           = False # Enable DBSCAN cluster outlier removal
+ENABLE_DBSCAN           = True  # Enable DBSCAN cluster outlier removal
 DBSCAN_EPS              = 0.08  # DBSCAN neighbourhood radius (m)
 DBSCAN_MIN_SAMPLES      = 5     # Minimum points to form a cluster
 DBSCAN_MIN_CLUSTER_SIZE = 30    # Minimum cluster size to keep
@@ -61,12 +61,16 @@ OCCLUSION_MIN_CONSENSUS = 0.60  # Fraction of views a point must be visible in
 RANSAC_DISTANCE_THRESH      = 0.03   # Max inlier distance for RANSAC floor/table plane extraction (m)
 RANSAC_N                    = 3      # Number of points sampled per RANSAC plane hypothesis
 RANSAC_NUM_ITERATIONS       = 1000   # Number of RANSAC iterations
+RANSAC_MAX_PLANES           = 12     # Maximum RANSAC planes to extract (ensures tabletop planes are found)
 ROOM_FLOOR_NORMAL_TOLERANCE = 0.85   # Min abs(dot(normal, gravity_up)) to qualify as horizontal plane
 ROOM_WALL_NORMAL_TOLERANCE  = 0.25   # Max abs(dot(normal, gravity_up)) to qualify as vertical wall plane
+TABLE_MIN_HEIGHT            = 0.30   # Minimum height above floor for a surface to be considered a table (m)
+TABLE_MAX_HEIGHT            = 1.40   # Maximum height above floor for a surface to be considered a table (m)
 
 # ── ObjectEstimator & 3D Surface Meshing ─────────────────────────────────────
 ALPHA_SHAPE_ALPHA              = 0.10   # Alpha-Shape concavity parameter for 3D mesh surface generation (m)
 OBJECT_DEPTH_FOREGROUND_MARGIN = 0.35   # Max depth delta beyond median object depth to prune background bleed (m)
+OBJECT_EXTRACT_FROM_WORLD_PCD  = True   # Extract object point clouds directly from world_pointcloud.ply via 2D guidance
 
 # ── RoomBuilder & Wall Meshing ───────────────────────────────────────────────
 WALL_THICKNESS                 = 0.05   # Thickness of generated wall slab meshes in meters

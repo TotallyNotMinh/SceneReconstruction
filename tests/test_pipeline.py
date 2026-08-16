@@ -282,7 +282,12 @@ class TestFilters(unittest.TestCase):
 
 
 from spatial.room_builder import detect_architectural_planes, _compute_oriented_wall_geometry
-from spatial.object_estimator import backproject_mask_to_3d, filter_object_pointcloud_dbscan, process_object_detections
+from spatial.object_estimator import (
+    backproject_mask_to_3d,
+    filter_object_pointcloud_dbscan,
+    process_object_detections,
+    extract_object_points_from_world_pcd_view,
+)
 from spatial.mesh_placer import snap_mesh_to_surface, snap_mesh_to_wall, align_and_place_object_meshes
 import trimesh
 import json
@@ -372,11 +377,62 @@ class TestSpatialPhase1RoomBuilder(unittest.TestCase):
                 norm_len = np.linalg.norm(eq[:3])
                 self.assertAlmostEqual(norm_len, 1.0, places=5)
 
-    def test_detect_architectural_planes_missing_file(self):
+    def test_detect_architectural_planes_ceiling_separation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            missing_ply = Path(tmp_dir) / "non_existent.ply"
-            with self.assertRaises(FileNotFoundError):
-                detect_architectural_planes(ply_path=missing_ply)
+            ply_path = Path(tmp_dir) / "synthetic_room_with_ceiling.ply"
+            rng = np.random.default_rng(42)
+
+            # Floor at Y = 0.0
+            n_floor = 2000
+            floor_x = rng.uniform(-2.5, 2.5, n_floor)
+            floor_z = rng.uniform(-2.5, 2.5, n_floor)
+            floor_y = rng.normal(0.0, 0.005, n_floor)
+            floor_pts = np.column_stack([floor_x, floor_y, floor_z])
+
+            # Ceiling at Y = 2.8m (Should be classified as ceiling, NOT table)
+            n_ceil = 1500
+            ceil_x = rng.uniform(-2.5, 2.5, n_ceil)
+            ceil_z = rng.uniform(-2.5, 2.5, n_ceil)
+            ceil_y = rng.normal(2.8, 0.005, n_ceil)
+            ceil_pts = np.column_stack([ceil_x, ceil_y, ceil_z])
+
+            # Table at Y = 0.75m
+            n_table = 800
+            table_x = rng.uniform(-0.6, 0.6, n_table)
+            table_z = rng.uniform(-0.4, 0.4, n_table)
+            table_y = rng.normal(0.75, 0.005, n_table)
+            table_pts = np.column_stack([table_x, table_y, table_z])
+
+            # Wall at Z = -2.0m
+            n_wall = 1200
+            wall_x = rng.uniform(-2.0, 2.0, n_wall)
+            wall_y = rng.uniform(0.0, 2.2, n_wall)
+            wall_z = rng.normal(-2.0, 0.005, n_wall)
+            wall_pts = np.column_stack([wall_x, wall_y, wall_z])
+
+            all_pts = np.vstack([floor_pts, ceil_pts, table_pts, wall_pts])
+            cloud = trimesh.PointCloud(vertices=all_pts)
+            cloud.export(str(ply_path))
+
+            result = detect_architectural_planes(
+                ply_path=ply_path,
+                distance_threshold=0.04,
+                max_planes=6,
+                min_inliers=150,
+            )
+
+            # Sàn và Bàn và Trần nhà phải được tách biệt rõ ràng
+            self.assertIsNotNone(result["floor"])
+            self.assertAlmostEqual(result["floor"]["mean_y"], 0.0, delta=0.1)
+
+            # Table planes must only include the table at ~0.75m, NOT the ceiling at 2.8m
+            self.assertEqual(len(result["tables"]), 1)
+            self.assertAlmostEqual(result["tables"][0]["mean_y"], 0.75, delta=0.1)
+
+            # Ceiling must be captured under ceilings
+            self.assertIn("ceilings", result)
+            self.assertEqual(len(result["ceilings"]), 1)
+            self.assertAlmostEqual(result["ceilings"][0]["mean_y"], 2.8, delta=0.1)
 
     def test_compute_oriented_wall_geometry_clamping(self):
         # Case 1: Wall points starting near floor (min_y = 0.10m, floor_y = 0.0m) -> Clamped to floor_y
@@ -536,6 +592,138 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 process_object_detections(detections_path=missing_det, raw_depths_path=npz_path)
 
+    def test_extract_object_pointcloud_from_world_pcd(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pcd_path = Path(tmp_dir) / "world_pointcloud.ply"
+            npz_path = Path(tmp_dir) / "raw_depths.npz"
+            det_path = Path(tmp_dir) / "detections.json"
+            out_dir = Path(tmp_dir) / "objects"
+
+            # Create synthetic world point cloud: Chair points at (0.0, 0.0, -2.0) and background wall at (0.0, 0.0, -5.0)
+            rng = np.random.default_rng(42)
+            chair_pts = rng.uniform(-0.1, 0.1, size=(200, 3)) + np.array([0.0, 0.0, -2.0])
+            wall_pts = rng.uniform(-1.0, 1.0, size=(300, 3)) + np.array([0.0, 0.0, -5.0])
+            all_pts = np.vstack([chair_pts, wall_pts])
+            all_cols = np.tile([100, 150, 200], (len(all_pts), 1)).astype(np.uint8)
+
+            cloud = trimesh.PointCloud(vertices=all_pts, colors=all_cols)
+            cloud.export(str(pcd_path))
+
+            # Camera pointing at the chair
+            H, W = 60, 60
+            depth_0 = np.ones((H, W), dtype=np.float32) * 2.0
+            ixt_0 = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+            ext_0 = np.eye(4, dtype=np.float64)
+            np.savez(str(npz_path), depth_0=depth_0, ixt_0=ixt_0, ext_0=ext_0)
+
+            det_data = {
+                "obj_chair": {
+                    "label": "chair",
+                    "associated_views": [
+                        {
+                            "frame_index": 0,
+                            "bbox": [20, 20, 40, 40],
+                            "mask": [[20, 20], [40, 20], [40, 40], [20, 40]],
+                        }
+                    ]
+                }
+            }
+            with open(det_path, "w", encoding="utf-8") as f:
+                json.dump(det_data, f)
+
+            result = process_object_detections(
+                detections_path=det_path,
+                raw_depths_path=npz_path,
+                world_pcd_path=pcd_path,
+                out_dir=out_dir,
+            )
+
+            self.assertIn("obj_chair", result)
+            self.assertGreater(result["obj_chair"]["point_count"], 50)
+            self.assertTrue(Path(result["obj_chair"]["mesh_path"]).exists())
+            # Ensure background wall points at Z=-5.0m were pruned and only chair points near Z=-2.0m kept
+            bounds_min = result["obj_chair"]["bounds_min"]
+            self.assertGreater(bounds_min[2], -3.0)
+
+    def test_process_object_detections_with_trimesh_scene(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pcd_path = Path(tmp_dir) / "world_pointcloud.ply"
+            npz_path = Path(tmp_dir) / "raw_depths.npz"
+            det_path = Path(tmp_dir) / "detections.json"
+            out_dir = Path(tmp_dir) / "objects"
+
+            # Create a point cloud for world_pointcloud.ply
+            rng = np.random.default_rng(42)
+            pts1 = rng.uniform(-0.1, 0.1, size=(200, 3)) + np.array([0.0, 0.0, -2.0])
+            pc1 = trimesh.PointCloud(vertices=pts1)
+            pc1.export(str(pcd_path))
+
+            H, W = 60, 60
+            depth_0 = np.ones((H, W), dtype=np.float32) * 2.0
+            ixt_0 = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+            ext_0 = np.eye(4, dtype=np.float64)
+            np.savez(str(npz_path), depth_0=depth_0, ixt_0=ixt_0, ext_0=ext_0)
+
+            det_data = {
+                "obj_scene": {
+                    "label": "sofa",
+                    "associated_views": [
+                        {
+                            "frame_index": 0,
+                            "bbox": [20, 20, 40, 40],
+                        }
+                    ]
+                }
+            }
+            with open(det_path, "w", encoding="utf-8") as f:
+                json.dump(det_data, f)
+
+            result = process_object_detections(
+                detections_path=det_path,
+                raw_depths_path=npz_path,
+                world_pcd_path=pcd_path,
+                out_dir=out_dir,
+            )
+
+            self.assertIn("obj_scene", result)
+            self.assertGreater(result["obj_scene"]["point_count"], 50)
+            self.assertTrue(Path(result["obj_scene"]["mesh_path"]).exists())
+
+    def test_process_object_detections_disabled_dbscan(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            npz_path = Path(tmp_dir) / "raw_depths.npz"
+            det_path = Path(tmp_dir) / "detections.json"
+            out_dir = Path(tmp_dir) / "objects"
+
+            depth_0 = np.ones((60, 60), dtype=np.float32) * 1.8
+            ixt_0 = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+            ext_0 = np.eye(4, dtype=np.float64)
+            np.savez(str(npz_path), depth_0=depth_0, ixt_0=ixt_0, ext_0=ext_0)
+
+            det_data = {
+                "obj_nodbscan": {
+                    "label": "chair",
+                    "associated_views": [
+                        {"frame_index": 0, "bbox": [20, 20, 40, 40]}
+                    ]
+                }
+            }
+            with open(det_path, "w", encoding="utf-8") as f:
+                json.dump(det_data, f)
+
+            orig_dbscan = config.ENABLE_DBSCAN
+            try:
+                config.ENABLE_DBSCAN = False
+                result = process_object_detections(
+                    detections_path=det_path,
+                    raw_depths_path=npz_path,
+                    out_dir=out_dir
+                )
+                self.assertIn("obj_nodbscan", result)
+                self.assertGreater(result["obj_nodbscan"]["point_count"], 0)
+            finally:
+                config.ENABLE_DBSCAN = orig_dbscan
+
     def test_missing_raw_depths_raises_filenotfound(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             det_path = Path(tmp_dir) / "detections.json"
@@ -654,6 +842,152 @@ class TestSpatialPhase3MeshPlacer(unittest.TestCase):
             chair_item = summary_dict["obj_2_chair"]
             self.assertEqual(chair_item["placement_type"], "floor")
             self.assertAlmostEqual(chair_item["delta_y_applied"], -0.4, places=4)
+
+    def test_align_tabletop_object_with_depth_noise(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+            planes_json_path = Path(tmp_dir) / "detected_planes.json"
+            out_dir = Path(tmp_dir) / "objects_aligned"
+
+            # Cup/laptop on table: Table is at Y=0.75m.
+            # Object bottom has slight depth noise (min_y = 0.58m, lower by 17cm, but center_y is at 0.85m)
+            laptop_mesh = trimesh.creation.box(extents=[0.3, 0.2, 0.3])
+            # Box height is 0.2m, center at Y=0.68m -> min_y = 0.58m, max_y = 0.78m
+            laptop_mesh.apply_translation([0.0, 0.68, 0.0])
+            laptop_mesh.export(str(objs_dir / "obj_1_laptop.ply"))
+
+            manifest_data = {
+                "obj_1_laptop": {"label": "laptop"}
+            }
+            with open(objs_dir / "objects_manifest.json", "w", encoding="utf-8") as f:
+                json.dump(manifest_data, f)
+
+            planes_data = {
+                "floor": {"mean_y": 0.0, "min_bound": [-3, -0.05, -3], "max_bound": [3, 0.05, 3]},
+                "tables": [
+                    {
+                        "id": 1,
+                        "mean_y": 0.75,
+                        "min_bound": [-0.6, 0.73, -0.6],
+                        "max_bound": [0.6, 0.77, 0.6],
+                    }
+                ],
+                "walls": []
+            }
+            with open(planes_json_path, "w", encoding="utf-8") as f:
+                json.dump(planes_data, f)
+
+            summary = align_and_place_object_meshes(
+                objects_dir=objs_dir,
+                plane_data_path=planes_json_path,
+                out_dir=out_dir
+            )
+
+            self.assertEqual(len(summary), 1)
+            item = summary[0]
+            # Must be placed on table (not dropped to floor)
+            self.assertEqual(item["placement_type"], "table")
+            # Bottom should be moved from 0.58m up to table surface 0.75m -> delta_y = +0.17m
+            self.assertAlmostEqual(item["delta_y_applied"], 0.17, places=3)
+
+    def test_align_tabletop_tv(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+            planes_json_path = Path(tmp_dir) / "detected_planes.json"
+            out_dir = Path(tmp_dir) / "objects_aligned"
+
+            # Desktop TV resting on TV stand table at Y=0.50m
+            tv_mesh = trimesh.creation.box(extents=[0.8, 0.5, 0.1])
+            tv_mesh.apply_translation([0.0, 0.75, 0.0])  # min_y = 0.50m
+            tv_mesh.export(str(objs_dir / "obj_tv.ply"))
+
+            manifest_data = {
+                "obj_tv": {"label": "tv"}
+            }
+            with open(objs_dir / "objects_manifest.json", "w", encoding="utf-8") as f:
+                json.dump(manifest_data, f)
+
+            planes_data = {
+                "floor": {"mean_y": 0.0, "min_bound": [-3, -0.05, -3], "max_bound": [3, 0.05, 3]},
+                "tables": [
+                    {
+                        "id": 1,
+                        "mean_y": 0.50,
+                        "min_bound": [-0.8, 0.48, -0.4],
+                        "max_bound": [0.8, 0.52, 0.4],
+                    }
+                ],
+                "walls": [
+                    {
+                        "id": 0,
+                        "equation": [0.0, 0.0, 1.0, 2.0],  # Wall far away at Z=-2.0m
+                        "normal": [0.0, 0.0, 1.0],
+                        "min_bound": [-3, 0, -2.05],
+                        "max_bound": [3, 3, -1.95],
+                    }
+                ]
+            }
+            with open(planes_json_path, "w", encoding="utf-8") as f:
+                json.dump(planes_data, f)
+
+            summary = align_and_place_object_meshes(
+                objects_dir=objs_dir,
+                plane_data_path=planes_json_path,
+                out_dir=out_dir
+            )
+
+            self.assertEqual(len(summary), 1)
+            item = summary[0]
+            # Must be placed on tabletop
+            self.assertEqual(item["placement_type"], "table")
+
+    def test_align_tabletop_object_max_y_branch(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+            planes_json_path = Path(tmp_dir) / "detected_planes.json"
+            out_dir = Path(tmp_dir) / "objects_aligned"
+
+            # Tall object: Table is at Y=0.75m.
+            # Object height = 0.40m, center_y = 0.60m -> min_y = 0.40m, max_y = 0.80m
+            # Notice obj_center_y (0.60) < t_y - 0.10 (0.65), so Python MUST evaluate obj_max_y > t_y (0.80 > 0.75)
+            tall_object = trimesh.creation.box(extents=[0.2, 0.4, 0.2])
+            tall_object.apply_translation([0.0, 0.60, 0.0])
+            tall_object.export(str(objs_dir / "obj_tall.ply"))
+
+            manifest_data = {
+                "obj_tall": {"label": "bottle"}
+            }
+            with open(objs_dir / "objects_manifest.json", "w", encoding="utf-8") as f:
+                json.dump(manifest_data, f)
+
+            planes_data = {
+                "floor": {"mean_y": 0.0, "min_bound": [-3, -0.05, -3], "max_bound": [3, 0.05, 3]},
+                "tables": [
+                    {
+                        "id": 1,
+                        "mean_y": 0.75,
+                        "min_bound": [-0.6, 0.73, -0.6],
+                        "max_bound": [0.6, 0.77, 0.6],
+                    }
+                ],
+                "walls": []
+            }
+            with open(planes_json_path, "w", encoding="utf-8") as f:
+                json.dump(planes_data, f)
+
+            summary = align_and_place_object_meshes(
+                objects_dir=objs_dir,
+                plane_data_path=planes_json_path,
+                out_dir=out_dir
+            )
+
+            self.assertEqual(len(summary), 1)
+            item = summary[0]
+            self.assertEqual(item["placement_type"], "table")
+            self.assertAlmostEqual(item["delta_y_applied"], 0.35, places=3)
 
     def test_align_empty_objects_dir_returns_empty(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
