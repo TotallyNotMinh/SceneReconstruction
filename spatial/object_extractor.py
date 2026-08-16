@@ -62,6 +62,18 @@ def _build_2d_mask(view: Dict[str, Any], H: int, W: int) -> np.ndarray:
     return mask_2d
 
 
+def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+    """
+    Convert RGB array (N, 3) with range [0, 255] to OpenCV CIELAB (N, 3) float32.
+    CIELAB separates lightness (L) from chromaticity (a, b), making it robust to cast shadows.
+    """
+    if len(rgb) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+    lab = cv2.cvtColor(rgb_u8.reshape(1, -1, 3), cv2.COLOR_RGB2LAB).reshape(-1, 3)
+    return lab.astype(np.float32)
+
+
 def extract_object_points_from_world_pcd_view(
     world_pts: np.ndarray,
     world_cols: Optional[np.ndarray],
@@ -69,12 +81,16 @@ def extract_object_points_from_world_pcd_view(
     K: np.ndarray,
     c2w: np.ndarray,
     depth_map: Optional[np.ndarray] = None,
+    rgb_frame: Optional[np.ndarray] = None,
     depth_tolerance: float = getattr(config, "OBJECT_DEPTH_CONSISTENCY_TOLERANCE", 0.10),
     foreground_margin: float = getattr(config, "OBJECT_DEPTH_FOREGROUND_MARGIN", 0.85),
+    enable_color_filter: bool = getattr(config, "ENABLE_OBJECT_COLOR_FILTER", True),
+    color_delta_e_max: float = getattr(config, "OBJECT_COLOR_DELTA_E_MAX", 45.0),
+    color_sample_count: int = getattr(config, "OBJECT_COLOR_MASK_SAMPLE_COUNT", 300),
 ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """
     Project 3D world points onto a 2D camera view and select points falling inside the 2D mask
-    with depth-consistency verification.
+    with depth-consistency and CIELAB color-consistency verification.
 
     Parameters
     ----------
@@ -84,8 +100,12 @@ def extract_object_points_from_world_pcd_view(
     K : (3, 3) intrinsic camera matrix.
     c2w : (4, 4) camera-to-world pose matrix.
     depth_map : Optional (H, W) float depth map in meters for depth consistency gating.
+    rgb_frame : Optional (H, W, 3) uint8 RGB image for color consistency verification.
     depth_tolerance : Max allowable |Z_cam - Z_depth| delta in meters when depth map is present.
     foreground_margin : Fallback depth delta when depth map is absent.
+    enable_color_filter : Whether to apply CIELAB color consistency gating.
+    color_delta_e_max : Maximum allowable perceptual color distance (Delta E) in CIELAB space.
+    color_sample_count : Number of pixels to sample from 2D mask to build color distribution.
 
     Returns
     -------
@@ -133,8 +153,8 @@ def extract_object_points_from_world_pcd_view(
     if len(matched_idx) == 0:
         return np.zeros((0, 3)), None, np.zeros(0, dtype=np.int64)
 
-    # Depth Consistency Gating:
-    # 1. If depth map is available for this frame, enforce |Z_cam - depth_map[v, u]| <= depth_tolerance
+    # 1. Depth Consistency Gating:
+    # If depth map is available for this frame, enforce |Z_cam - depth_map[v, u]| <= depth_tolerance
     if depth_map is not None and depth_map.shape[:2] == (H, W) and depth_tolerance > 0:
         u_matched = u[matched_idx]
         v_matched = v[matched_idx]
@@ -154,6 +174,47 @@ def extract_object_points_from_world_pcd_view(
         effective_margin = max(foreground_margin, 0.85)
         fg_mask = matched_z <= (near_z + effective_margin)
         matched_idx = matched_idx[fg_mask]
+
+    # 3. CIELAB Color-Consistency Gating:
+    # Filter out points that deviate strongly in color from the 2D object mask
+    if enable_color_filter and world_cols is not None and rgb_frame is not None and len(matched_idx) > 0:
+        try:
+            if rgb_frame.shape[:2] != (H, W):
+                rgb_frame_eval = cv2.resize(rgb_frame, (W, H), interpolation=cv2.INTER_LINEAR)
+            else:
+                rgb_frame_eval = rgb_frame
+
+            mask_v, mask_u = np.where(mask_2d > 0)
+            if len(mask_v) >= 5:
+                n_samp = min(len(mask_v), color_sample_count)
+                if len(mask_v) > n_samp:
+                    idx_choice = np.linspace(0, len(mask_v) - 1, n_samp, dtype=np.int64)
+                    samp_v, samp_u = mask_v[idx_choice], mask_u[idx_choice]
+                else:
+                    samp_v, samp_u = mask_v, mask_u
+
+                mask_rgb = rgb_frame_eval[samp_v, samp_u]
+                mask_lab = _rgb_to_lab(mask_rgb)
+
+                cand_rgb = world_cols[matched_idx]
+                cand_lab = _rgb_to_lab(cand_rgb)
+
+                from scipy.spatial import cKDTree
+                mask_tree = cKDTree(mask_lab)
+                min_delta_e, _ = mask_tree.query(cand_lab, k=1)
+
+                u_m = u[matched_idx]
+                v_m = v[matched_idx]
+                local_rgb = rgb_frame_eval[v_m, u_m]
+                local_lab = _rgb_to_lab(local_rgb)
+                local_delta_e = np.linalg.norm(cand_lab - local_lab, axis=1)
+
+                # Point is retained if its color is consistent with 2D mask manifold or local pixel
+                color_mask = (min_delta_e <= color_delta_e_max) | (local_delta_e <= (color_delta_e_max * 1.15))
+                if np.any(color_mask) and np.sum(color_mask) >= 4:
+                    matched_idx = matched_idx[color_mask]
+        except Exception:
+            pass
 
     selected_pts = world_pts[matched_idx]
     selected_cols = world_cols[matched_idx] if world_cols is not None else None
@@ -244,7 +305,9 @@ def _get_plane_inlier_mask(
     pts: np.ndarray,
     label: str,
     plane_data: Optional[Dict[str, Any]],
+    cols: Optional[np.ndarray] = None,
     margin: float = getattr(config, "PLANE_SUBTRACTION_MARGIN", 0.015),
+    enable_color_contrast: bool = getattr(config, "ENABLE_SUPPORT_PLANE_COLOR_CONTRAST", True),
 ) -> np.ndarray:
     """Internal helper: return boolean mask of non-plane points."""
     n_pts = len(pts)
@@ -295,7 +358,7 @@ def _filter_plane_inliers(
     Remove floor and tabletop plane points that may have been accidentally included.
     Returns (pts_filtered, cols_filtered).
     """
-    keep_mask = _get_plane_inlier_mask(pts, label, plane_data, margin=margin)
+    keep_mask = _get_plane_inlier_mask(pts, label, plane_data, cols=cols, margin=margin)
     pts_filtered = pts[keep_mask]
     cols_filtered = cols[keep_mask] if cols is not None else None
     return pts_filtered, cols_filtered
@@ -533,10 +596,11 @@ def extract_object_pointclouds(
                 c2w = np.eye(4, dtype=np.float64)
 
             mask_2d = _build_2d_mask(view, H, W)
+            rgb_frame = npz[f"rgb_{f_idx}"] if f"rgb_{f_idx}" in npz else None
 
             # Exact point selection from world point cloud via 2D projection
             _, _, m_idx = extract_object_points_from_world_pcd_view(
-                world_pts, world_cols, mask_2d, K, c2w, depth_map=depth_map
+                world_pts, world_cols, mask_2d, K, c2w, depth_map=depth_map, rgb_frame=rgb_frame
             )
             if len(m_idx) > 0:
                 matched_indices_list.append(m_idx)
@@ -566,7 +630,8 @@ def extract_object_pointclouds(
 
         # Optional Plane Inlier Filter
         if filter_planes and plane_data is not None:
-            plane_keep = _get_plane_inlier_mask(cand_pts, label, plane_data)
+            cand_cols = world_cols[merged_idx] if world_cols is not None else None
+            plane_keep = _get_plane_inlier_mask(cand_pts, label, plane_data, cols=cand_cols)
             merged_idx = merged_idx[plane_keep]
             cand_pts = world_pts[merged_idx]
 

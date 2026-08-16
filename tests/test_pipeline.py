@@ -1124,6 +1124,74 @@ class TestSpatialPhase2AObjectExtractor(unittest.TestCase):
             self.assertIn("obj_lamp", res)
             self.assertTrue((out_dir / "extracted_objects_manifest.json").exists())
 
+    def test_color_consistency_filter_prunes_wrong_color_points(self):
+        """
+        Verify that CIELAB color consistency gating cleanly removes wrong-colored background/floor points
+        that fall inside the 2D mask while retaining genuine object points.
+        """
+        # Red object points
+        red_pts = np.array([
+            [0.0, 0.0, 1.5],
+            [0.05, 0.05, 1.5],
+            [-0.05, 0.05, 1.5],
+            [0.0, -0.05, 1.5],
+            [0.05, -0.05, 1.5],
+        ], dtype=np.float64)
+        red_cols = np.array([[220, 30, 30]] * len(red_pts), dtype=np.uint8)
+
+        # Grey floor/background points in same 2D projection
+        grey_pts = np.array([
+            [0.02, 0.02, 1.5],
+            [-0.02, -0.02, 1.5],
+            [0.03, -0.03, 1.5],
+        ], dtype=np.float64)
+        grey_cols = np.array([[190, 190, 190]] * len(grey_pts), dtype=np.uint8)
+
+        world_pts = np.vstack([red_pts, grey_pts])
+        world_cols = np.vstack([red_cols, grey_cols])
+
+        mask_2d = np.ones((100, 100), dtype=np.uint8)
+        K = np.array([[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        c2w = np.eye(4, dtype=np.float64)
+
+        # 2D frame image is red in object mask
+        rgb_frame = np.full((100, 100, 3), [220, 30, 30], dtype=np.uint8)
+
+        # Gated extraction with color filtering enabled
+        sel_pts, sel_cols, m_idx = extract_object_points_from_world_pcd_view(
+            world_pts,
+            world_cols,
+            mask_2d,
+            K,
+            c2w,
+            rgb_frame=rgb_frame,
+            enable_color_filter=True,
+            color_delta_e_max=35.0,
+        )
+
+        # Red points must be retained (5 points)
+        self.assertEqual(len(sel_pts), len(red_pts))
+        # All selected points must be red
+        self.assertTrue(np.all(sel_cols[:, 0] > 180))
+        self.assertTrue(np.all(sel_cols[:, 1] < 60))
+
+    def test_color_filter_graceful_fallback_uncolored(self):
+        """
+        Verify that extraction gracefully falls back to geometric extraction when colors are absent.
+        """
+        pts = np.array([[0.0, 0.0, 1.5], [0.05, 0.05, 1.5]], dtype=np.float64)
+        mask_2d = np.ones((100, 100), dtype=np.uint8)
+        K = np.array([[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        c2w = np.eye(4, dtype=np.float64)
+
+        # When world_cols is None
+        sel_pts, sel_cols, m_idx = extract_object_points_from_world_pcd_view(
+            pts, None, mask_2d, K, c2w, enable_color_filter=True
+        )
+        self.assertEqual(len(sel_pts), 2)
+        self.assertIsNone(sel_cols)
+
+
 
 class TestSpatialPhase2BObjectMesher(unittest.TestCase):
 

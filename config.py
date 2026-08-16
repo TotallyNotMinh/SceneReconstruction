@@ -66,6 +66,11 @@ OBJECT_VIEW_CONSENSUS_RATIO  = 0.30   # Min fraction of multi-view detections a 
 PLANE_SUBTRACTION_MARGIN     = 0.015  # Distance margin to subtract floor/tabletop plane points from objects (m)
 ENABLE_DUAL_SOURCE_OBJECT_EXTRACTION = False # Deprecated: Keep False to guarantee 0 synthetic/interpolated points
 OBJECT_DEPTH_CONSISTENCY_TOLERANCE = 0.10   # Max absolute delta |Z_cam - Z_depth| in meters for depth gating (10cm)
+ENABLE_OBJECT_COLOR_FILTER   = True   # Enable CIELAB color consistency verification between 2D masks and 3D points
+OBJECT_COLOR_DELTA_E_MAX     = 45.0   # Max allowable CIELAB Euclidean color distance (Delta E) to 2D mask appearance
+OBJECT_COLOR_MASK_SAMPLE_COUNT = 300  # Number of pixels to sample from 2D mask to model object color manifold
+ENABLE_SUPPORT_PLANE_COLOR_CONTRAST = True # Prune base contact points whose color matches underlying plane
+
 
 
 # ── RoomBuilder & RANSAC Plane Detection ──────────────────────────────────────
