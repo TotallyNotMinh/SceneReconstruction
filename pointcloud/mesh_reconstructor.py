@@ -12,7 +12,7 @@ Supports:
 import sys
 import argparse
 from pathlib import Path
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union, Any
 import numpy as np
 
 # Add project root to sys.path
@@ -33,6 +33,165 @@ try:
     _TRIMESH_AVAILABLE = True
 except ImportError:
     _TRIMESH_AVAILABLE = False
+
+
+def _fill_trimesh_holes_robust(tri_mesh: Any) -> Any:
+    """Robust pure NumPy boundary loop closure for trimesh objects."""
+    if not hasattr(tri_mesh, "edges_sorted") or len(tri_mesh.faces) == 0:
+        return tri_mesh
+    edges = tri_mesh.edges_sorted
+    unique, counts = np.unique(edges, axis=0, return_counts=True)
+    boundary_edges = unique[counts == 1]
+    if len(boundary_edges) == 0:
+        return tri_mesh
+
+    adj: dict[int, list[int]] = {}
+    for u, v in boundary_edges:
+        adj.setdefault(int(u), []).append(int(v))
+        adj.setdefault(int(v), []).append(int(u))
+
+    visited = set()
+    new_faces = []
+    for start_node in adj:
+        if start_node in visited:
+            continue
+        cycle = [start_node]
+        visited.add(start_node)
+        curr = start_node
+        prev = None
+        while True:
+            nbrs = [n for n in adj[curr] if n != prev]
+            if not nbrs:
+                break
+            next_node = nbrs[0]
+            if next_node == start_node:
+                break
+            if next_node in visited:
+                break
+            visited.add(next_node)
+            cycle.append(next_node)
+            prev = curr
+            curr = next_node
+
+        if len(cycle) == 3:
+            new_faces.append(cycle)
+        elif len(cycle) == 4:
+            new_faces.append([cycle[0], cycle[1], cycle[2]])
+            new_faces.append([cycle[0], cycle[2], cycle[3]])
+        elif 4 < len(cycle) <= 24:
+            for i in range(1, len(cycle) - 1):
+                new_faces.append([cycle[0], cycle[i], cycle[i+1]])
+
+    if new_faces:
+        all_faces = np.vstack([tri_mesh.faces, np.array(new_faces)])
+        v_cols = tri_mesh.visual.vertex_colors if (hasattr(tri_mesh, "visual") and hasattr(tri_mesh.visual, "vertex_colors")) else None
+        return trimesh.Trimesh(vertices=tri_mesh.vertices, faces=all_faces, vertex_colors=v_cols, process=False)
+    return tri_mesh
+
+
+def fill_mesh_holes(mesh: Any) -> Any:
+    """Detect and seal open boundary loops and triangular holes on a 3D mesh."""
+    if _TRIMESH_AVAILABLE and isinstance(mesh, trimesh.Trimesh):
+        try:
+            return _fill_trimesh_holes_robust(mesh)
+        except Exception:
+            return mesh
+
+    if _O3D_AVAILABLE and isinstance(mesh, o3d.geometry.TriangleMesh):
+        try:
+            if _TRIMESH_AVAILABLE:
+                verts = np.asarray(mesh.vertices)
+                faces = np.asarray(mesh.triangles)
+                cols = (np.asarray(mesh.vertex_colors) * 255).astype(np.uint8) if mesh.has_vertex_colors() else None
+                tri = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=cols, process=False)
+                tri = _fill_trimesh_holes_robust(tri)
+                out_o3d = o3d.geometry.TriangleMesh()
+                out_o3d.vertices = o3d.utility.Vector3dVector(np.asarray(tri.vertices))
+                out_o3d.triangles = o3d.utility.Vector3iVector(np.asarray(tri.faces))
+                if tri.visual.vertex_colors is not None and len(tri.visual.vertex_colors) == len(tri.vertices):
+                    out_o3d.vertex_colors = o3d.utility.Vector3dVector(np.asarray(tri.visual.vertex_colors)[:, :3] / 255.0)
+                return out_o3d
+        except Exception:
+            pass
+    return mesh
+
+
+def smooth_mesh_taubin(
+    mesh: Any,
+    iterations: int = getattr(config, "MESH_TAUBIN_ITERATIONS", 12),
+    lambda_filter: float = 0.5,
+    mu: float = -0.53,
+) -> Any:
+    """Apply non-shrinking Taubin smoothing to eliminate depth surface noise and roughness."""
+    if iterations <= 0:
+        return mesh
+
+    if _O3D_AVAILABLE and isinstance(mesh, o3d.geometry.TriangleMesh):
+        try:
+            if len(mesh.vertices) >= 4 and len(mesh.triangles) >= 4:
+                mesh.remove_degenerate_triangles()
+                mesh.remove_duplicated_triangles()
+                mesh.remove_duplicated_vertices()
+                mesh.remove_non_manifold_edges()
+                smoothed = mesh.filter_smooth_taubin(
+                    number_of_iterations=iterations,
+                    lambda_filter=lambda_filter,
+                    mu=mu,
+                )
+                s_verts = np.asarray(smoothed.vertices)
+                if len(s_verts) > 0 and np.all(np.isfinite(s_verts)):
+                    smoothed.compute_vertex_normals()
+                    return smoothed
+        except Exception:
+            return mesh
+
+    if _TRIMESH_AVAILABLE and isinstance(mesh, trimesh.Trimesh):
+        try:
+            if _O3D_AVAILABLE and len(mesh.vertices) >= 4 and len(mesh.faces) >= 4:
+                o3d_m = o3d.geometry.TriangleMesh()
+                o3d_m.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices, dtype=np.float64))
+                o3d_m.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces, dtype=np.int32))
+                o3d_m.remove_degenerate_triangles()
+                o3d_m.remove_duplicated_triangles()
+                o3d_m.remove_duplicated_vertices()
+                o3d_m.remove_non_manifold_edges()
+                smoothed = o3d_m.filter_smooth_taubin(
+                    number_of_iterations=iterations,
+                    lambda_filter=lambda_filter,
+                    mu=mu,
+                )
+                s_verts = np.asarray(smoothed.vertices)
+                if len(s_verts) > 0 and np.all(np.isfinite(s_verts)):
+                    v_cols = mesh.visual.vertex_colors if (hasattr(mesh, "visual") and hasattr(mesh.visual, "vertex_colors")) else None
+                    return trimesh.Trimesh(
+                        vertices=s_verts,
+                        faces=np.asarray(smoothed.triangles),
+                        vertex_colors=v_cols,
+                        process=False,
+                    )
+        except Exception:
+            return mesh
+
+    return mesh
+
+
+def post_process_mesh(
+    mesh: Any,
+    fill_holes: bool = getattr(config, "FILL_MESH_HOLES", True),
+    smooth: bool = True,
+    iterations: int = getattr(config, "MESH_TAUBIN_ITERATIONS", 12),
+) -> Any:
+    """Execute complete post-processing pipeline on 3D mesh."""
+    if mesh is None:
+        return None
+
+    if fill_holes:
+        mesh = fill_mesh_holes(mesh)
+
+    if smooth and iterations > 0:
+        mesh = smooth_mesh_taubin(mesh, iterations=iterations)
+
+    return mesh
 
 
 def mesh_pointcloud(
@@ -188,11 +347,14 @@ def mesh_pointcloud(
 
         return tri_mesh
 
-    # Clean Open3D mesh
+    # Clean and post-process Open3D mesh
     mesh_o3d.remove_degenerate_triangles()
     mesh_o3d.remove_duplicated_triangles()
     mesh_o3d.remove_duplicated_vertices()
     mesh_o3d.remove_non_manifold_edges()
+
+    # Apply non-shrinking Taubin smoothing and hole sealing
+    mesh_o3d = post_process_mesh(mesh_o3d, fill_holes=getattr(config, "FILL_MESH_HOLES", True), smooth=True)
 
     # Preserve and transfer RGB vertex colors from input point cloud onto mesh surface
     if pcd.has_colors() and len(mesh_o3d.vertices) > 0:

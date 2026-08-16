@@ -128,14 +128,14 @@ def _cluster_outlier_removal(
 
 def build_pointcloud_from_npz(
     npz_path: Path | str,
-    point_step: int = 4,
+    point_step: int = getattr(config, "POINTCLOUD_POINT_STEP", 2),
     return_depth_maps: bool = False,
     depth_metric_min: float = config.DEPTH_METRIC_MIN,
     depth_metric_max: float = config.DEPTH_METRIC_MAX,
     voxel_size: float = config.VOXEL_SIZE_PCD,
     conf_percentile: float = 0.0,
-    sor_neighbors: int = 20,
-    sor_std_ratio: float = 2.0,
+    sor_neighbors: int = 15,
+    sor_std_ratio: float = 2.5,
     enable_ror: bool = config.ENABLE_ROR,
     ror_radius: float = config.ROR_RADIUS,
     ror_min_neighbors: int = config.ROR_MIN_NEIGHBORS,
@@ -433,14 +433,14 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Stage 1 Pass 2: 3D Point Cloud Construction")
     parser.add_argument("npz", type=str, nargs="?", default=str(DEFAULT_NPZ_PATH), help="Path to raw_depths.npz file")
-    parser.add_argument("--step", "--point-step", type=int, default=4, dest="step", help="Pixel stride per frame (default: 4, 1 = full resolution)")
-    parser.add_argument("--voxel-size", type=float, default=config.VOXEL_SIZE_PCD, help="Voxel downsampling size in meters (default: 0.02)")
+    parser.add_argument("--step", "--point-step", type=int, default=getattr(config, "POINTCLOUD_POINT_STEP", 2), dest="step", help="Pixel stride per frame (default: 2, 1 = full resolution)")
+    parser.add_argument("--voxel-size", type=float, default=config.VOXEL_SIZE_PCD, help="Voxel downsampling size in meters (default: 0.015)")
     parser.add_argument("--conf-percentile", type=float, default=0.0, help="Confidence percentile threshold (default: 0.0 = no clipping, 30.0 = drop bottom 30%%)")
-    parser.add_argument("--sor-neighbors", type=int, default=20, help="Statistical outlier removal number of neighbors (default: 20)")
-    parser.add_argument("--sor-std-ratio", type=float, default=2.0, help="Statistical outlier removal standard deviation ratio (default: 2.0)")
+    parser.add_argument("--sor-neighbors", type=int, default=15, help="Statistical outlier removal number of neighbors (default: 15)")
+    parser.add_argument("--sor-std-ratio", type=float, default=2.5, help="Statistical outlier removal standard deviation ratio (default: 2.5)")
     parser.add_argument("--ror", "--radius-removal", action=argparse.BooleanOptionalAction, default=config.ENABLE_ROR, help="Enable/disable Radius Outlier Removal (ROR)")
     parser.add_argument("--ror-radius", type=float, default=config.ROR_RADIUS, help="Radius Outlier Removal search radius in meters (default: 0.05)")
-    parser.add_argument("--ror-min-neighbors", type=int, default=config.ROR_MIN_NEIGHBORS, help="Radius Outlier Removal minimum neighbors inside radius (default: 5)")
+    parser.add_argument("--ror-min-neighbors", type=int, default=config.ROR_MIN_NEIGHBORS, help="Radius Outlier Removal minimum neighbors inside radius (default: 4)")
 
     parser.add_argument("--dbscan", action=argparse.BooleanOptionalAction, default=config.ENABLE_DBSCAN, help="Enable/disable DBSCAN cluster outlier removal")
     parser.add_argument("--dbscan-eps", type=float, default=config.DBSCAN_EPS, help="DBSCAN cluster outlier removal epsilon radius in meters (default: 0.05)")

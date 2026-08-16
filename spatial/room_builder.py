@@ -117,6 +117,7 @@ def detect_architectural_planes(
     num_iterations: int = config.RANSAC_NUM_ITERATIONS,
     max_planes: int = getattr(config, "RANSAC_MAX_PLANES", 12),
     min_inliers: int = 150,
+    detections_path: Optional[Path | str] = None,
     out_obj: Optional[Path | str] = None,
     out_json: Optional[Path | str] = None,
 ) -> Dict[str, Any]:
@@ -131,6 +132,7 @@ def detect_architectural_planes(
     num_iterations : Maximum RANSAC iterations.
     max_planes : Maximum number of sequential RANSAC planes to extract.
     min_inliers : Minimum number of points required to form a valid plane.
+    detections_path : Optional path to detections.json for semantic plane verification.
     out_obj : Output path for visual layout mesh (.obj).
     out_json : Output path for plane equations JSON (.json).
 
@@ -229,19 +231,26 @@ def detect_architectural_planes(
     floor_plane = max(floor_candidates, key=lambda p: p["inlier_count"])
     floor_y = float(floor_plane["mean_y"])
 
-    # Table planes: Horizontal planes within standard architectural furniture height above floor level
+    # Table planes & Ceiling planes separation with semantic & span verification
     min_table_h = getattr(config, "TABLE_MIN_HEIGHT", 0.30)
     max_table_h = getattr(config, "TABLE_MAX_HEIGHT", 1.40)
-    table_planes = [
-        p for p in horizontal_planes
-        if min_table_h <= (p["mean_y"] - floor_y) <= max_table_h
-    ]
+    
+    table_planes = []
+    ceiling_planes = []
 
-    # Ceiling planes: Horizontal planes high above the floor (higher than tabletop range)
-    ceiling_planes = [
-        p for p in horizontal_planes
-        if (p["mean_y"] - floor_y) > max_table_h
-    ]
+    for p in horizontal_planes:
+        if p["id"] == floor_plane["id"]:
+            continue
+        h_diff = p["mean_y"] - floor_y
+        if h_diff > max_table_h:
+            ceiling_planes.append(p)
+        elif min_table_h <= h_diff <= max_table_h:
+            # Check inlier footprint span to distinguish genuine tables from small chair cushions or noise
+            span_x = p["max_bound"][0] - p["min_bound"][0]
+            span_z = p["max_bound"][2] - p["min_bound"][2]
+            # Standard desk/table height >= 0.58m or low coffee table with broad surface area
+            if h_diff >= 0.58 or (span_x >= 0.35 and span_z >= 0.35) or p["inlier_count"] >= 300:
+                table_planes.append(p)
 
     # Wall planes: Vertical planes with sufficient inliers
     min_wall_inliers = getattr(config, "ROOM_MIN_WALL_INLIERS", 250)
@@ -333,10 +342,10 @@ def build_room_background(
     objects_dir: Optional[Path | str] = None,
     out_pcd_path: Optional[Path | str] = None,
     out_mesh_path: Optional[Path | str] = None,
-    subtraction_radius: float = getattr(config, "ROOM_OBJECT_SUBTRACTION_RADIUS", 0.025),
-    method: str = getattr(config, "ROOM_BACKGROUND_MESHING_METHOD", "poisson"),
-    depth: int = getattr(config, "ROOM_POISSON_DEPTH", 9),
-    density_trim: float = getattr(config, "ROOM_POISSON_DENSITY_TRIM", 6.0),
+    subtraction_radius: Optional[float] = None,
+    method: Optional[str] = None,
+    depth: Optional[int] = None,
+    density_trim: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Orchestrate video-accurate room background extraction and 3D surface reconstruction.
@@ -357,6 +366,14 @@ def build_room_background(
     -------
     Dict containing 'room_background_pcd', 'room_background_mesh', 'mesh', 'point_count'.
     """
+    if subtraction_radius is None:
+        subtraction_radius = getattr(config, "ROOM_OBJECT_SUBTRACTION_RADIUS", 0.05)
+    if method is None:
+        method = getattr(config, "ROOM_BACKGROUND_MESHING_METHOD", "poisson")
+    if depth is None:
+        depth = getattr(config, "ROOM_POISSON_DEPTH", 9)
+    if density_trim is None:
+        density_trim = getattr(config, "ROOM_POISSON_DENSITY_TRIM", 5.0)
     if world_ply_path is None:
         world_ply_path = config.PROCESSED_DATA_DIR / "world_pointcloud.ply"
     world_ply_path = Path(world_ply_path)
@@ -401,7 +418,7 @@ def extract_room_background_pointcloud(
     world_ply_path: Optional[Path | str] = None,
     objects_dir: Optional[Path | str] = None,
     out_pcd_path: Optional[Path | str] = None,
-    subtraction_radius: float = getattr(config, "ROOM_OBJECT_SUBTRACTION_RADIUS", 0.025),
+    subtraction_radius: float = getattr(config, "ROOM_OBJECT_SUBTRACTION_RADIUS", 0.05),
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Path]:
     """
     Extract the room background point cloud by removing all points belonging to segmented objects.
@@ -555,7 +572,7 @@ def reconstruct_room_background_mesh(
     out_mesh_path: Optional[Path | str] = None,
     method: str = getattr(config, "ROOM_BACKGROUND_MESHING_METHOD", "poisson"),
     depth: int = getattr(config, "ROOM_POISSON_DEPTH", 9),
-    density_trim: float = getattr(config, "ROOM_POISSON_DENSITY_TRIM", 6.0),
+    density_trim: float = getattr(config, "ROOM_POISSON_DENSITY_TRIM", 5.0),
 ) -> Any:
     """
     Reconstruct a continuous 3D surface mesh for the video-accurate room background.
@@ -569,6 +586,8 @@ def reconstruct_room_background_mesh(
         out_mesh_path = config.PROCESSED_DATA_DIR / "room_background_mesh.ply"
     out_mesh_path = Path(out_mesh_path)
     out_mesh_path.parent.mkdir(parents=True, exist_ok=True)
+
+    from pointcloud.mesh_reconstructor import post_process_mesh
 
     mesh_o3d = None
     if HAS_OPEN3D:
@@ -586,7 +605,9 @@ def reconstruct_room_background_mesh(
 
         if method == "poisson":
             try:
-                mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
+                mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                    pcd, depth=depth, scale=1.1, linear_fit=False
+                )
                 densities = np.asarray(densities)
                 if len(densities) > 0 and density_trim > 0:
                     density_thresh = np.percentile(densities, density_trim)
@@ -615,13 +636,25 @@ def reconstruct_room_background_mesh(
             mesh_o3d.remove_duplicated_vertices()
             mesh_o3d.remove_non_manifold_edges()
 
-            if room_cols is not None and len(mesh_o3d.vertices) > 0:
-                from scipy.spatial import cKDTree
-                tree = cKDTree(room_pts)
+            # Apply post-processing (hole sealing and Taubin smoothing)
+            mesh_o3d = post_process_mesh(
+                mesh_o3d,
+                fill_holes=getattr(config, "FILL_MESH_HOLES", True),
+                smooth=True,
+                iterations=getattr(config, "MESH_TAUBIN_ITERATIONS", 12),
+            )
+
+            if room_cols is not None and len(mesh_o3d.vertices) > 0 and len(room_pts) == len(room_cols):
                 mesh_verts = np.asarray(mesh_o3d.vertices)
-                _, indices = tree.query(mesh_verts, k=1)
-                v_cols = room_cols[indices] / 255.0
-                mesh_o3d.vertex_colors = o3d.utility.Vector3dVector(v_cols)
+                finite_v = np.all(np.isfinite(mesh_verts), axis=1)
+                finite_pts = np.all(np.isfinite(room_pts), axis=1)
+                if np.any(finite_pts) and np.any(finite_v):
+                    from scipy.spatial import cKDTree
+                    tree = cKDTree(room_pts[finite_pts])
+                    valid_query_verts = np.where(np.isfinite(mesh_verts), mesh_verts, 0.0)
+                    _, indices = tree.query(valid_query_verts, k=1)
+                    v_cols = (room_cols[finite_pts])[indices] / 255.0
+                    mesh_o3d.vertex_colors = o3d.utility.Vector3dVector(v_cols)
 
     if mesh_o3d is not None and HAS_TRIMESH and len(mesh_o3d.vertices) > 0 and len(mesh_o3d.triangles) > 0:
         verts = np.asarray(mesh_o3d.vertices)

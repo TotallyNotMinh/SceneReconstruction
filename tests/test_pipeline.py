@@ -920,6 +920,53 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 process_object_detections(detections_path=det_path, raw_depths_path=missing_npz)
 
+    def test_object_estimator_world_pcd_only_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pts = np.random.uniform(-0.2, 0.2, (200, 3))
+            pts[:, 2] += 1.5
+            pcd = trimesh.PointCloud(vertices=pts)
+            pcd_path = Path(tmp_dir) / "world_pointcloud.ply"
+            pcd.export(str(pcd_path))
+
+            det_data = {
+                "obj_chair": {
+                    "label": "chair",
+                    "associated_views": [{"frame_index": 0, "bbox": [0, 0, 640, 480], "score": 0.95}],
+                }
+            }
+            det_path = Path(tmp_dir) / "detections.json"
+            with open(det_path, "w", encoding="utf-8") as f:
+                json.dump(det_data, f)
+
+            meta_data = {
+                "frames": [
+                    {
+                        "index": 0,
+                        "pose_matrix": np.eye(4).tolist(),
+                        "fl_x": 500.0,
+                        "fl_y": 500.0,
+                        "cx": 320.0,
+                        "cy": 240.0,
+                        "w": 640,
+                        "h": 480,
+                    }
+                ]
+            }
+            meta_path = Path(tmp_dir) / "ar_metadata.json"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta_data, f)
+
+            out_dir = Path(tmp_dir) / "objects"
+            res = process_object_detections(
+                detections_path=det_path,
+                raw_depths_path=None,
+                ar_metadata_path=meta_path,
+                world_pcd_path=pcd_path,
+                out_dir=out_dir,
+            )
+            self.assertIn("obj_chair", res)
+            self.assertGreater(res["obj_chair"]["point_count"], 0)
+
 
 class TestSpatialPhase3MeshPlacer(unittest.TestCase):
 
@@ -1336,6 +1383,111 @@ class TestSpatialPhase3MeshPlacer(unittest.TestCase):
             )
             self.assertIsNotNone(scene)
             self.assertTrue(scene_path.exists())
+
+
+from pointcloud.mesh_reconstructor import fill_mesh_holes, smooth_mesh_taubin, post_process_mesh
+
+
+class TestPipelineEnhancements(unittest.TestCase):
+
+    def test_semantic_and_span_table_plane_verification(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ply_path = Path(tmp_dir) / "room.ply"
+            rng = np.random.default_rng(42)
+
+            # Floor at Y = 0.0
+            n_floor = 1500
+            fx = rng.uniform(-2, 2, n_floor)
+            fz = rng.uniform(-2, 2, n_floor)
+            fy = rng.normal(0.0, 0.005, n_floor)
+            floor_pts = np.column_stack([fx, fy, fz])
+
+            # Small chair cushion patch at Y = 0.45m (narrow span: 0.20m x 0.20m, 50 points -> not a table)
+            n_cushion = 50
+            cx = rng.uniform(-0.1, 0.1, n_cushion)
+            cz = rng.uniform(-0.1, 0.1, n_cushion)
+            cy = rng.normal(0.45, 0.005, n_cushion)
+            cushion_pts = np.column_stack([cx, cy, cz])
+
+            # Real Desk at Y = 0.75m (broad span: 0.8m x 0.8m, 400 points)
+            n_table = 400
+            tx = rng.uniform(-0.4, 0.4, n_table)
+            tz = rng.uniform(-0.4, 0.4, n_table)
+            ty = rng.normal(0.75, 0.005, n_table)
+            table_pts = np.column_stack([tx, ty, tz])
+
+            all_pts = np.vstack([floor_pts, cushion_pts, table_pts])
+            trimesh.PointCloud(vertices=all_pts).export(str(ply_path))
+
+            res = detect_architectural_planes(
+                ply_path=ply_path,
+                distance_threshold=0.03,
+                max_planes=4,
+                min_inliers=40,
+            )
+
+            # Verify that the desk at 0.75m is captured as a table plane
+            self.assertIsNotNone(res["floor"])
+            self.assertTrue(any(abs(tp["mean_y"] - 0.75) < 0.05 for tp in res["tables"]))
+
+    def test_adaptive_foreground_depth_gating_deep_object(self):
+        # Deep desk/sofa extending from 1.0m to 1.7m depth (depth delta = 0.7m)
+        mask_2d = np.ones((60, 60), dtype=np.uint8)
+        depth_map = np.linspace(1.0, 1.7, 60)[:, None] * np.ones((1, 60))
+        K = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        c2w = np.eye(4, dtype=np.float64)
+
+        # With adaptive foreground_margin >= 0.85m, entire depth range 1.0m - 1.7m must be captured
+        pts_w, _ = backproject_mask_to_3d(mask_2d, depth_map, K, c2w, foreground_margin=0.85)
+        self.assertGreater(len(pts_w), 0)
+        self.assertAlmostEqual(float(pts_w[:, 2].min()), 1.0, places=1)
+        self.assertAlmostEqual(float(pts_w[:, 2].max()), 1.7, places=1)
+
+    def test_mesh_hole_filling_and_taubin_smoothing(self):
+        # Create a cube mesh with a hole (missing 2 faces)
+        cube = trimesh.creation.box(extents=[0.5, 0.5, 0.5])
+        # Remove a face to introduce open boundary
+        open_cube = trimesh.Trimesh(vertices=cube.vertices, faces=cube.faces[:-2])
+        self.assertFalse(open_cube.is_watertight)
+
+        # Post-process (fill holes + Taubin smoothing)
+        repaired = post_process_mesh(open_cube, fill_holes=True, smooth=True, iterations=5)
+        self.assertIsNotNone(repaired)
+        self.assertGreater(len(repaired.faces), len(open_cube.faces))
+
+    def test_dilated_room_subtraction_purges_chair_legs(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            world_ply = Path(tmp_dir) / "world.ply"
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+            out_pcd = Path(tmp_dir) / "room_bg.ply"
+
+            # World points: Floor points at Y=0.0, plus chair body at (1.0, 0.5, 1.0) and chair wheel at (1.03, 0.02, 1.03)
+            rng = np.random.default_rng(42)
+            floor_pts = rng.uniform(-1.0, 1.0, size=(100, 3))
+            floor_pts[:, 1] = 0.0
+            chair_body_pts = rng.uniform(0.9, 1.1, size=(50, 3))
+            chair_body_pts[:, 1] = 0.5
+            chair_wheel_pts = np.array([[1.03, 0.02, 1.03], [0.98, 0.02, 0.98]])
+
+            all_world = np.vstack([floor_pts, chair_body_pts, chair_wheel_pts])
+            trimesh.PointCloud(vertices=all_world).export(str(world_ply))
+
+            # Segmented chair point cloud
+            chair_pcd = objs_dir / "obj_1_chair_pointcloud.ply"
+            trimesh.PointCloud(vertices=chair_body_pts).export(str(chair_pcd))
+
+            # With dilated subtraction radius = 0.05m (5cm) or proximity
+            bg_pts, _, p_out = extract_room_background_pointcloud(
+                world_ply_path=world_ply,
+                objects_dir=objs_dir,
+                out_pcd_path=out_pcd,
+                subtraction_radius=0.05,
+            )
+
+            self.assertTrue(p_out.exists())
+            # Chair body at Y=0.5m must be removed
+            self.assertFalse(np.any((bg_pts[:, 1] > 0.4) & (bg_pts[:, 1] < 0.6)))
 
 
 if __name__ == "__main__":
