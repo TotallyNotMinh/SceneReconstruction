@@ -82,10 +82,12 @@ SceneReconstruction/
 │   └── sam_segmentor.py          # MobileSAM per-object pixel segmentation wrapper
 │
 ├── spatial/                      # 3D Spatial Reconstruction Engine
-│   ├── object_estimator.py       # Multi-view back-projection & 3D Alpha-Shape meshing
-│   ├── room_builder.py           # RANSAC architectural floor/table plane detector
-│   ├── mesh_placer.py            # Support surface snapping & spatial alignment
-│   └── scene_assembler.py        # Main 3D digital twin scene orchestrator
+│   ├── object_extractor.py       # Phase 2A: 3D point cloud extraction & segmentation (0 synthetic points)
+│   ├── object_mesher.py          # Phase 2B: High-fidelity 3D surface mesh generation (Poisson / BPA / Alpha)
+│   ├── object_estimator.py       # Unified orchestrator wrapper (extract -> mesh)
+│   ├── room_builder.py           # RANSAC architectural floor/table plane detector & room background
+│   ├── mesh_placer.py            # Natural world placement & support surface snapping
+
 │
 ├── visualization/                # Renderers & Visualizer Utilities
 │   ├── render_side_by_side.py    # Side-by-side depth video renderer
@@ -342,9 +344,11 @@ python spatial/scene_assembler.py
 
 #### Internal Processing Steps:
 1. **Architectural Plane Detection**: Runs **RANSAC** plane fitting on the point cloud to identify floor and tabletop support surfaces (`spatial/room_builder.py`).
-2. **Instance Masking & Back-Projection**: Refines 2D object masks using **MobileSAM** and back-projects 2D pixels into 3D point clusters (`spatial/object_estimator.py`).
-3. **3D Alpha-Shape Meshing**: Fits 3D Alpha Shapes (`alpha=0.10`) around point clusters and decimates high-density geometry.
-4. **Surface Snapping & Assembly**: Aligns and snaps object meshes onto detected support surfaces (`spatial/mesh_placer.py`) and packages the scene (`spatial/scene_assembler.py`).
+2. **Object Point Cloud Extraction (Phase 2A)**: Extracts exact 3D point clusters directly from `world_pointcloud.ply` with 100% attribute fidelity and zero synthetic points (`spatial/object_extractor.py`).
+3. **Optional Intermediate AI Point Cloud Completion**: Colleague's AI completion step can enrich extracted point clouds before meshing.
+4. **3D Surface Meshing (Phase 2B)**: Reconstructs watertight meshes using **Screened Poisson**, BPA, or Alpha Shapes with Taubin smoothing and hole sealing (`spatial/object_mesher.py`).
+5. **Natural Placement & Assembly**: Places object meshes directly at their natural world coordinates and packages the full scene (`spatial/mesh_placer.py`).
+
 
 #### Final Generated Artifact:
 - `data/output/digital_twin_scene.glb` — Assembled, interactive 3D digital twin scene

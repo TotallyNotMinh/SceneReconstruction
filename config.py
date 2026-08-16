@@ -57,14 +57,16 @@ DBSCAN_EPS                   = 0.08   # Whole-scene DBSCAN radius (m)
 DBSCAN_MIN_SAMPLES           = 5      # Whole-scene DBSCAN min samples
 DBSCAN_MIN_CLUSTER_SIZE      = 30     # Whole-scene DBSCAN min cluster size
 
-# ── ObjectEstimator: Back-projection & Clustering ────────────────────────────
+# ── ObjectExtractor: 3D Point Cloud Extraction & Clustering ────────────────
 OBJECT_ENABLE_DBSCAN         = True   # Enable DBSCAN cluster outlier removal for object instances
 OBJECT_DBSCAN_EPS            = 0.06   # Object DBSCAN neighbourhood radius (m)
 OBJECT_DBSCAN_MIN_SAMPLES    = 4      # Object DBSCAN min samples
 OBJECT_DBSCAN_MIN_CLUSTER_SIZE = 10   # Object DBSCAN min cluster size
 OBJECT_VIEW_CONSENSUS_RATIO  = 0.30   # Min fraction of multi-view detections a 3D point must be observed in
 PLANE_SUBTRACTION_MARGIN     = 0.015  # Distance margin to subtract floor/tabletop plane points from objects (m)
-ENABLE_DUAL_SOURCE_OBJECT_EXTRACTION = True # Fuse world_pointcloud with direct raw depth back-projections
+ENABLE_DUAL_SOURCE_OBJECT_EXTRACTION = False # Deprecated: Keep False to guarantee 0 synthetic/interpolated points
+OBJECT_DEPTH_CONSISTENCY_TOLERANCE = 0.10   # Max absolute delta |Z_cam - Z_depth| in meters for depth gating (10cm)
+
 
 # ── RoomBuilder & RANSAC Plane Detection ──────────────────────────────────────
 RANSAC_DISTANCE_THRESH      = 0.03   # Max inlier distance for RANSAC floor/table plane extraction (m)
@@ -102,12 +104,14 @@ ROOM_MIN_WALL_INLIERS          = 250               # Minimum inlier points requi
 EXPORT_ROOM_CAD_SLABS          = True              # Export room_layout.obj bounding box slabs alongside background mesh
 
 # ── MeshPlacer & Scene Assembly ──────────────────────────────────────────────
+ENABLE_SURFACE_SNAPPING     = False  # Default False: Place objects directly at natural extracted world coordinates (no artificial shift)
 SURFACE_SNAPPING_MARGIN     = 0.00   # Vertical offset margin when snapping mesh bottom to surface (m)
 WALL_SNAPPING_MARGIN        = 0.01   # Margin offset when snapping mesh onto vertical wall surface (m)
 EXPORT_FULL_SCENE           = True   # Automatically assemble full scene (room background + aligned objects) into data/output
 WALL_MOUNTED_CLASSES        = {      # Semantic labels for objects mounted on walls
     "tv", "tvmonitor", "picture", "clock", "mirror", "whiteboard", "poster", "wall_art", "screen"
 }
+
 
 
 # ── Video Normalizer ─────────────────────────────────────────────────────────

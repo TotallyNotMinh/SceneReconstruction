@@ -155,8 +155,14 @@ def align_and_place_object_meshes(
     objects_dir: Optional[Path | str] = None,
     plane_data_path: Optional[Path | str] = None,
     out_dir: Optional[Path | str] = None,
+    enable_snapping: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
-    """Align and snap all object meshes onto detected architectural planes (Floors, Tables, Walls)."""
+    """
+    Align and place all object meshes in the scene.
+    By default (enable_snapping=False), places object meshes directly at their exact natural
+    world coordinates (delta = [0, 0, 0]) as extracted from world_pointcloud.ply.
+    If enable_snapping=True, snaps meshes to detected architectural support planes (floor, table, walls).
+    """
     if objects_dir is None:
         objects_dir = config.PROCESSED_DATA_DIR / "objects"
     objects_dir = Path(objects_dir)
@@ -170,21 +176,25 @@ def align_and_place_object_meshes(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if enable_snapping is None:
+        enable_snapping = getattr(config, "ENABLE_SURFACE_SNAPPING", False)
+
     # Load plane metadata (from Phase 1 RoomBuilder)
     floor_y = 0.0
     table_planes: List[Dict[str, Any]] = []
     wall_planes: List[Dict[str, Any]] = []
 
-    if plane_data_path.exists():
-        with open(plane_data_path, "r", encoding="utf-8") as pf:
-            planes_json = json.load(pf)
-        floor = planes_json.get("floor")
-        if floor:
-            floor_y = float(floor.get("mean_y", 0.0))
-        table_planes = planes_json.get("tables", [])
-        wall_planes = planes_json.get("walls", [])
-    else:
-        print(f"[MeshPlacer] Plane metadata file not found at {plane_data_path}. Defaulting floor_y = 0.0m")
+    if enable_snapping:
+        if plane_data_path.exists():
+            with open(plane_data_path, "r", encoding="utf-8") as pf:
+                planes_json = json.load(pf)
+            floor = planes_json.get("floor")
+            if floor:
+                floor_y = float(floor.get("mean_y", 0.0))
+            table_planes = planes_json.get("tables", [])
+            wall_planes = planes_json.get("walls", [])
+        else:
+            print(f"[MeshPlacer] Plane metadata file not found at {plane_data_path}. Defaulting floor_y = 0.0m")
 
     # Load object manifest if available
     manifest_path = objects_dir / "objects_manifest.json"
@@ -197,9 +207,19 @@ def align_and_place_object_meshes(
     mesh_files = []
     if objects_manifest:
         for obj_id, obj_meta in objects_manifest.items():
+            label = obj_meta.get("label", "object")
             m_p = obj_meta.get("mesh_path")
             if m_p and Path(m_p).exists():
                 mesh_files.append(Path(m_p))
+            else:
+                c1 = objects_dir / f"{obj_id}_{label}.ply"
+                c2 = objects_dir / f"{obj_id}.ply"
+                c3 = objects_dir / f"{obj_id}_{label}.obj"
+                c4 = objects_dir / f"{obj_id}.obj"
+                for cand in [c1, c2, c3, c4]:
+                    if cand.exists():
+                        mesh_files.append(cand)
+                        break
 
     if not mesh_files:
         mesh_files = [
@@ -215,7 +235,8 @@ def align_and_place_object_meshes(
         print(f"[MeshPlacer] No object mesh files found in '{objects_dir}'. Nothing to align.")
         return []
 
-    print(f"[MeshPlacer] Aligning & Snapping {len(mesh_files)} object meshes onto support planes/walls...")
+    mode_str = "snapping onto support planes/walls" if enable_snapping else "natural world coordinates (1:1 placement)"
+    print(f"[MeshPlacer] Placing {len(mesh_files)} object meshes with {mode_str}...")
     aligned_summary: List[Dict[str, Any]] = []
 
     for m_path in mesh_files:
@@ -232,12 +253,19 @@ def align_and_place_object_meshes(
             raise ImportError("Either trimesh or open3d is required.")
 
         # Determine object label / semantic category
-        obj_info = objects_manifest.get(m_path.stem, {})
+        obj_info = objects_manifest.get(m_path.stem)
+        if not obj_info:
+            for k, v in objects_manifest.items():
+                if k == m_path.stem or m_path.stem.startswith(f"{k}_"):
+                    obj_info = v
+                    break
+        if not obj_info:
+            obj_info = {}
+
         label = obj_info.get("label", "")
         if not label:
             parts = m_path.stem.split("_")
             if len(parts) > 2:
-                # Try joining last 2 parts first (e.g. 'wall_art' from 'obj_3_wall_art')
                 candidate = "_".join(parts[-2:]).lower()
                 label = candidate if candidate in config.WALL_MOUNTED_CLASSES else parts[-1].lower()
             elif len(parts) > 1:
@@ -251,74 +279,73 @@ def align_and_place_object_meshes(
         if len(verts) == 0:
             continue
 
-        obj_min_y = float(verts[:, 1].min())
-        obj_max_y = float(verts[:, 1].max())
-        obj_min_x = float(verts[:, 0].min())
-        obj_max_x = float(verts[:, 0].max())
-        obj_min_z = float(verts[:, 2].min())
-        obj_max_z = float(verts[:, 2].max())
-        obj_center_x = (obj_min_x + obj_max_x) / 2.0
-        obj_center_y = float(verts[:, 1].mean())
-        obj_center_z = (obj_min_z + obj_max_z) / 2.0
-
-        # Check if object is directly resting on a detected tabletop plane
-        matching_table_y = None
-        for tp in table_planes:
-            t_y = float(tp.get("mean_y", 0.0))
-            min_b = tp.get("min_bound", [-1e5, t_y, -1e5])
-            max_b = tp.get("max_bound", [1e5, t_y, 1e5])
-
-            # Check horizontal footprint overlap with margin
-            margin_h = 0.25
-            in_x = (min_b[0] - margin_h) <= obj_center_x <= (max_b[0] + margin_h)
-            in_z = (min_b[2] - margin_h) <= obj_center_z <= (max_b[2] + margin_h)
-
-            # Robust condition:
-            # 1. Object bottom is reasonably near tabletop (>= t_y - 0.35m)
-            # 2. Object center or top is at or above tabletop
-            is_above_table = (obj_min_y >= t_y - 0.35) and ((obj_center_y >= t_y - 0.10) or (obj_max_y > t_y))
-            if in_x and in_z and is_above_table:
-                if matching_table_y is None or t_y > matching_table_y:
-                    matching_table_y = t_y
-
-        # If object is wall-mounted type (e.g. TV / monitor / picture):
-        # If it is situated right on top of a table (like a desktop monitor or tabletop TV), snap to table.
-        # Otherwise, snap to nearest vertical wall plane.
-        is_mounted_on_wall = is_wall_mounted and (
-            matching_table_y is None
-            or obj_min_y > matching_table_y + 0.35
-            or obj_center_y > matching_table_y + 0.85
-        )
-        if is_mounted_on_wall:
-            # Wall-mounted object: Snap horizontally to nearest vertical wall plane, keep Y elevation
-            if wall_planes:
-                _cx, _cy, _cz = obj_center_x, obj_center_y, obj_center_z
-                best_wall = min(
-                    wall_planes,
-                    key=lambda wp, cx=_cx, cy=_cy, cz=_cz: abs(
-                        wp.get("equation", [0, 0, 1, 0])[0] * cx
-                        + wp.get("equation", [0, 0, 1, 0])[1] * cy
-                        + wp.get("equation", [0, 0, 1, 0])[2] * cz
-                        + wp.get("equation", [0, 0, 1, 0])[3]
-                    ),
-                )
-                snapped_mesh, delta_vec = snap_mesh_to_wall(mesh, best_wall, margin=config.WALL_SNAPPING_MARGIN)
-                placement_type = "wall"
-                target_surface = f"wall_id_{best_wall.get('id')}"
-                delta_y = 0.0
-            else:
-                snapped_mesh = mesh
-                delta_vec = [0.0, 0.0, 0.0]
-                placement_type = "wall_unattached"
-                target_surface = "none"
-                delta_y = 0.0
+        if not enable_snapping:
+            # Natural 1:1 World Coordinate Placement (zero artificial shift)
+            snapped_mesh = mesh
+            delta_vec = [0.0, 0.0, 0.0]
+            delta_y = 0.0
+            placement_type = "natural_world"
+            target_surface = "world_coordinates"
         else:
-            # Floor / Tabletop supported object: Snap vertically to surface beneath object
-            target_surface_y = matching_table_y if matching_table_y is not None else floor_y
-            snapped_mesh, delta_y = snap_mesh_to_surface(mesh, surface_y=target_surface_y)
-            delta_vec = [0.0, delta_y, 0.0]
-            placement_type = "table" if target_surface_y > (floor_y + 0.10) else "floor"
-            target_surface = f"Y={target_surface_y:.3f}m"
+            obj_min_y = float(verts[:, 1].min())
+            obj_max_y = float(verts[:, 1].max())
+            obj_min_x = float(verts[:, 0].min())
+            obj_max_x = float(verts[:, 0].max())
+            obj_min_z = float(verts[:, 2].min())
+            obj_max_z = float(verts[:, 2].max())
+            obj_center_x = (obj_min_x + obj_max_x) / 2.0
+            obj_center_y = float(verts[:, 1].mean())
+            obj_center_z = (obj_min_z + obj_max_z) / 2.0
+
+            # Check if object is directly resting on a detected tabletop plane
+            matching_table_y = None
+            for tp in table_planes:
+                t_y = float(tp.get("mean_y", 0.0))
+                min_b = tp.get("min_bound", [-1e5, t_y, -1e5])
+                max_b = tp.get("max_bound", [1e5, t_y, 1e5])
+
+                margin_h = 0.25
+                in_x = (min_b[0] - margin_h) <= obj_center_x <= (max_b[0] + margin_h)
+                in_z = (min_b[2] - margin_h) <= obj_center_z <= (max_b[2] + margin_h)
+
+                is_above_table = (obj_min_y >= t_y - 0.35) and ((obj_center_y >= t_y - 0.10) or (obj_max_y > t_y))
+                if in_x and in_z and is_above_table:
+                    if matching_table_y is None or t_y > matching_table_y:
+                        matching_table_y = t_y
+
+            is_mounted_on_wall = is_wall_mounted and (
+                matching_table_y is None
+                or obj_min_y > matching_table_y + 0.35
+                or obj_center_y > matching_table_y + 0.85
+            )
+            if is_mounted_on_wall:
+                if wall_planes:
+                    _cx, _cy, _cz = obj_center_x, obj_center_y, obj_center_z
+                    best_wall = min(
+                        wall_planes,
+                        key=lambda wp, cx=_cx, cy=_cy, cz=_cz: abs(
+                            wp.get("equation", [0, 0, 1, 0])[0] * cx
+                            + wp.get("equation", [0, 0, 1, 0])[1] * cy
+                            + wp.get("equation", [0, 0, 1, 0])[2] * cz
+                            + wp.get("equation", [0, 0, 1, 0])[3]
+                        ),
+                    )
+                    snapped_mesh, delta_vec = snap_mesh_to_wall(mesh, best_wall, margin=config.WALL_SNAPPING_MARGIN)
+                    placement_type = "wall"
+                    target_surface = f"wall_id_{best_wall.get('id')}"
+                    delta_y = 0.0
+                else:
+                    snapped_mesh = mesh
+                    delta_vec = [0.0, 0.0, 0.0]
+                    placement_type = "wall_unattached"
+                    target_surface = "none"
+                    delta_y = 0.0
+            else:
+                target_surface_y = matching_table_y if matching_table_y is not None else floor_y
+                snapped_mesh, delta_y = snap_mesh_to_surface(mesh, surface_y=target_surface_y)
+                delta_vec = [0.0, delta_y, 0.0]
+                placement_type = "table" if target_surface_y > (floor_y + 0.10) else "floor"
+                target_surface = f"Y={target_surface_y:.3f}m"
 
         out_path = out_dir / m_path.name
         if HAS_TRIMESH and isinstance(snapped_mesh, trimesh.Trimesh):
@@ -474,20 +501,26 @@ def assemble_full_scene(
 
 
 class MeshPlacer:
-    """Class wrapper for Support Surface Snapping & Scene Assembly."""
+    """Class wrapper for Object Placement & Scene Assembly."""
 
     def __init__(
         self,
         objects_dir: Optional[Path | str] = None,
         plane_data_path: Optional[Path | str] = None,
         room_mesh_path: Optional[Path | str] = None,
+        enable_snapping: Optional[bool] = None,
     ):
         self.objects_dir = Path(objects_dir) if objects_dir else config.PROCESSED_DATA_DIR / "objects"
         self.plane_data_path = Path(plane_data_path) if plane_data_path else config.PROCESSED_DATA_DIR / "detected_planes.json"
         self.room_mesh_path = Path(room_mesh_path) if room_mesh_path else config.PROCESSED_DATA_DIR / "room_background_mesh.ply"
+        self.enable_snapping = enable_snapping
 
     def run(self) -> List[Dict[str, Any]]:
-        return align_and_place_object_meshes(self.objects_dir, self.plane_data_path)
+        return align_and_place_object_meshes(
+            self.objects_dir,
+            self.plane_data_path,
+            enable_snapping=self.enable_snapping,
+        )
 
 
 if __name__ == "__main__":
@@ -498,10 +531,14 @@ if __name__ == "__main__":
                         help="Input path for detected_planes.json")
     parser.add_argument("--out-dir", type=str, default=str(config.PROCESSED_DATA_DIR / "objects_aligned"),
                         help="Output directory for aligned & snapped object 3D meshes")
+    parser.add_argument("--enable-snapping", action="store_true", default=False,
+                        help="Enable artificial plane snapping (default: False, places objects naturally in world coordinates)")
     args = parser.parse_args()
 
     align_and_place_object_meshes(
         objects_dir=args.objects_dir,
         plane_data_path=args.planes_json,
         out_dir=args.out_dir,
+        enable_snapping=args.enable_snapping,
     )
+

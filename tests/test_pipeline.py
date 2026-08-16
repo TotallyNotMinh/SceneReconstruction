@@ -288,20 +288,32 @@ from spatial.room_builder import (
     reconstruct_room_background_mesh,
     build_room_background,
 )
-from spatial.object_estimator import (
-    backproject_mask_to_3d,
-    filter_object_pointcloud_dbscan,
-    process_object_detections,
+from spatial.object_extractor import (
+    ObjectExtractor,
+    extract_object_pointclouds,
     extract_object_points_from_world_pcd_view,
-    reconstruct_object_mesh,
+    filter_object_pointcloud_dbscan,
+    load_world_pointcloud,
     _filter_plane_inliers,
 )
+from spatial.object_mesher import (
+    ObjectMesher,
+    reconstruct_object_mesh,
+    reconstruct_object_meshes,
+)
+from spatial.object_estimator import (
+    ObjectEstimator,
+    backproject_mask_to_3d,
+    process_object_detections,
+)
 from spatial.mesh_placer import (
+    MeshPlacer,
     snap_mesh_to_surface,
     snap_mesh_to_wall,
     align_and_place_object_meshes,
     assemble_full_scene,
 )
+
 import trimesh
 import json
 
@@ -968,7 +980,276 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
             self.assertGreater(res["obj_chair"]["point_count"], 0)
 
 
+class TestSpatialPhase2AObjectExtractor(unittest.TestCase):
+
+    def test_extract_strictly_from_world_pointcloud_zero_synthetic_points(self):
+        """
+        Verify that 100% of extracted object points are an exact subset of world_pointcloud.ply
+        with identical coordinates and original RGB colors (0 synthetic points created).
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pcd_path = Path(tmp_dir) / "world_pointcloud.ply"
+            det_path = Path(tmp_dir) / "detections.json"
+            out_dir = Path(tmp_dir) / "objects"
+
+            rng = np.random.default_rng(123)
+            # 300 unique points in world point cloud
+            pts_world = rng.uniform(-1.0, 1.0, size=(300, 3)).astype(np.float64)
+            # Distinct RGB colors
+            cols_world = rng.integers(10, 240, size=(300, 3), dtype=np.uint8)
+
+            cloud = trimesh.PointCloud(vertices=pts_world, colors=cols_world)
+            cloud.export(str(pcd_path))
+
+            # Object detection with bounding box covering part of the scene
+            det_data = {
+                "obj_table": {
+                    "label": "table",
+                    "associated_views": [
+                        {
+                            "frame_index": 0,
+                            "bbox": [0, 0, 640, 480],
+                            "score": 0.98,
+                        }
+                    ]
+                }
+            }
+            with open(det_path, "w", encoding="utf-8") as f:
+                json.dump(det_data, f)
+
+            meta_data = {
+                "frames": [
+                    {
+                        "index": 0,
+                        "pose_matrix": np.eye(4).tolist(),
+                        "fl_x": 500.0,
+                        "fl_y": 500.0,
+                        "cx": 320.0,
+                        "cy": 240.0,
+                        "w": 640,
+                        "h": 480,
+                    }
+                ]
+            }
+            meta_path = Path(tmp_dir) / "ar_metadata.json"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta_data, f)
+
+            manifest = extract_object_pointclouds(
+                detections_path=det_path,
+                ar_metadata_path=meta_path,
+                world_pcd_path=pcd_path,
+                out_dir=out_dir,
+                enable_dbscan=False,
+            )
+
+            self.assertIn("obj_table", manifest)
+            obj_pcd_file = Path(manifest["obj_table"]["pcd_path"])
+            self.assertTrue(obj_pcd_file.exists())
+
+            extracted_cloud = trimesh.load(str(obj_pcd_file))
+            ext_pts = np.asarray(extracted_cloud.vertices)
+            ext_cols = np.asarray(extracted_cloud.colors)[:, :3]
+
+            self.assertGreater(len(ext_pts), 0)
+
+            # Strict verification: every single extracted point must exist identically in pts_world
+            for i, pt in enumerate(ext_pts):
+                dists = np.linalg.norm(pts_world - pt, axis=1)
+                min_idx = np.argmin(dists)
+                self.assertAlmostEqual(dists[min_idx], 0.0, places=5, msg="Extracted point does not exist in source point cloud!")
+                # Verify exact RGB colors match
+                np.testing.assert_array_equal(ext_cols[i], cols_world[min_idx], err_msg="Point color was altered or interpolated!")
+
+    def test_depth_consistency_gating_rejects_background_bleed(self):
+        """
+        Verify that background surface points behind the object are cleanly rejected
+        by depth-consistency checking against the frame's depth map.
+        """
+        H, W = 60, 60
+        K = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        c2w = np.eye(4, dtype=np.float64)
+
+        # 1 foreground point at Z=1.5m and 1 background point at Z=4.0m projecting to center pixel (30, 30)
+        fg_pt = np.array([0.0, 0.0, 1.5])
+        bg_pt = np.array([0.0, 0.0, 4.0])
+        world_pts = np.vstack([fg_pt, bg_pt])
+
+        mask_2d = np.zeros((H, W), dtype=np.uint8)
+        mask_2d[20:40, 20:40] = 255  # Mask covering center
+
+        # Depth map observed foreground surface at 1.5m
+        depth_map = np.ones((H, W), dtype=np.float64) * 1.5
+
+        sel_pts, _, sel_idx = extract_object_points_from_world_pcd_view(
+            world_pts=world_pts,
+            world_cols=None,
+            mask_2d=mask_2d,
+            K=K,
+            c2w=c2w,
+            depth_map=depth_map,
+            depth_tolerance=0.10,
+        )
+
+        # Only the foreground point (index 0) at Z=1.5m should survive
+        self.assertEqual(len(sel_idx), 1)
+        self.assertEqual(sel_idx[0], 0)
+        self.assertAlmostEqual(sel_pts[0, 2], 1.5, places=4)
+
+    def test_extractor_class_interface(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pcd_path = Path(tmp_dir) / "world_pointcloud.ply"
+            det_path = Path(tmp_dir) / "detections.json"
+            out_dir = Path(tmp_dir) / "objects"
+
+            rng = np.random.default_rng(42)
+            pts = rng.uniform(-0.2, 0.2, size=(100, 3)) + np.array([0.0, 0.0, 1.5])
+            trimesh.PointCloud(vertices=pts).export(str(pcd_path))
+
+            det_data = {
+                "obj_lamp": {
+                    "label": "lamp",
+                    "associated_views": [{"frame_index": 0, "bbox": [0, 0, 640, 480]}]
+                }
+            }
+            with open(det_path, "w", encoding="utf-8") as f:
+                json.dump(det_data, f)
+
+            extractor = ObjectExtractor(
+                detections_path=det_path,
+                world_pcd_path=pcd_path,
+                out_dir=out_dir,
+            )
+            res = extractor.run()
+            self.assertIn("obj_lamp", res)
+            self.assertTrue((out_dir / "extracted_objects_manifest.json").exists())
+
+
+class TestSpatialPhase2BObjectMesher(unittest.TestCase):
+
+    def test_reconstruct_object_meshes_from_pointclouds(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+
+            rng = np.random.default_rng(42)
+            # Create synthetic point cloud on sphere
+            u = rng.uniform(0, 2 * np.pi, 250)
+            v = rng.uniform(0, np.pi, 250)
+            pts = np.column_stack([0.3 * np.sin(v) * np.cos(u), 0.3 * np.sin(v) * np.sin(u), 0.3 * np.cos(v)])
+            cols = rng.integers(50, 220, size=(250, 3), dtype=np.uint8)
+
+            pcd_path = objs_dir / "obj_0_sphere_pointcloud.ply"
+            trimesh.PointCloud(vertices=pts, colors=cols).export(str(pcd_path))
+
+            manifest_path = objs_dir / "extracted_objects_manifest.json"
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "obj_0": {
+                        "label": "sphere",
+                        "pcd_path": str(pcd_path),
+                        "point_count": len(pts),
+                    }
+                }, f)
+
+            mesher = ObjectMesher(objects_dir=objs_dir, manifest_path=manifest_path, method="poisson", depth=6)
+            res = mesher.run()
+
+            self.assertIn("obj_0", res)
+            out_mesh = Path(res["obj_0"]["mesh_path"])
+            self.assertTrue(out_mesh.exists())
+            self.assertGreater(res["obj_0"]["vertex_count"], 0)
+            self.assertGreater(res["obj_0"]["face_count"], 0)
+
+    def test_intermediate_ai_pointcloud_completion_workflow(self):
+        """
+        Simulate the two-stage decoupled pipeline where an intermediate AI Point Cloud Completion
+        step augments the extracted point cloud before passing it to ObjectMesher.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+
+            # Step 1: Raw extracted sparse point cloud (e.g. 50 points)
+            rng = np.random.default_rng(42)
+            sparse_pts = rng.uniform(-0.2, 0.2, size=(50, 3))
+            raw_pcd = objs_dir / "obj_chair_pointcloud.ply"
+            trimesh.PointCloud(vertices=sparse_pts).export(str(raw_pcd))
+
+            # Step 2: Intermediate AI Completion Step (enriches to 300 points)
+            dense_completed_pts = rng.uniform(-0.2, 0.2, size=(300, 3))
+            completed_pcd = objs_dir / "obj_chair_pointcloud.ply"
+            trimesh.PointCloud(vertices=dense_completed_pts).export(str(completed_pcd))
+
+            # Step 3: ObjectMesher takes the completed point cloud
+            mesh_summary = reconstruct_object_meshes(
+                objects_dir=objs_dir,
+                method="poisson",
+                depth=6,
+            )
+            self.assertIn("obj_chair", mesh_summary)
+            self.assertEqual(mesh_summary["obj_chair"]["point_count"], 300)
+            self.assertTrue(Path(mesh_summary["obj_chair"]["mesh_path"]).exists())
+
+    def test_fallback_pointcloud_discovery_patterns(self):
+        """
+        Verify that various point cloud naming patterns without manifest are cleanly parsed.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+
+            rng = np.random.default_rng(42)
+            pts = rng.uniform(-0.2, 0.2, size=(50, 3))
+
+            # Pattern 1: obj_1_chair_pointcloud.ply -> obj_id='obj_1', label='chair'
+            trimesh.PointCloud(vertices=pts).export(str(objs_dir / "obj_1_chair_pointcloud.ply"))
+            # Pattern 2: obj_chair_chair_pointcloud.ply -> obj_id='obj_chair', label='chair'
+            trimesh.PointCloud(vertices=pts).export(str(objs_dir / "obj_chair_chair_pointcloud.ply"))
+            # Pattern 3: table_pointcloud.ply -> obj_id='table', label='table'
+            trimesh.PointCloud(vertices=pts).export(str(objs_dir / "table_pointcloud.ply"))
+
+            res = reconstruct_object_meshes(objects_dir=objs_dir, method="poisson", depth=6)
+            self.assertIn("obj_1", res)
+            self.assertEqual(res["obj_1"]["label"], "chair")
+            self.assertIn("obj_chair", res)
+            self.assertEqual(res["obj_chair"]["label"], "chair")
+            self.assertIn("table", res)
+
+
+
 class TestSpatialPhase3MeshPlacer(unittest.TestCase):
+
+    def test_natural_world_placement_default(self):
+        """
+        Verify that by default (enable_snapping=False), object meshes are placed at their
+        exact natural world coordinates (delta = [0, 0, 0]) without artificial shift.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            objs_dir = Path(tmp_dir) / "objects"
+            aligned_dir = Path(tmp_dir) / "objects_aligned"
+            objs_dir.mkdir()
+
+            box = trimesh.creation.box(extents=[0.4, 0.8, 0.4])
+            box.apply_translation([1.2, 0.75, -2.1])
+            m_path = objs_dir / "obj_test_box.ply"
+            box.export(str(m_path))
+
+            manifest = align_and_place_object_meshes(
+                objects_dir=objs_dir,
+                out_dir=aligned_dir,
+                enable_snapping=False,
+            )
+            self.assertEqual(len(manifest), 1)
+            entry = manifest[0]
+            self.assertEqual(entry["placement_type"], "natural_world")
+            self.assertEqual(entry["delta_translation"], [0.0, 0.0, 0.0])
+            self.assertEqual(entry["delta_y_applied"], 0.0)
+
+            # Placed mesh vertices must be identical to original
+            placed_mesh = trimesh.load(entry["aligned_path"])
+            np.testing.assert_array_almost_equal(placed_mesh.vertices, box.vertices)
+
 
     def test_snap_mesh_to_surface(self):
         box = trimesh.creation.box(extents=[0.4, 0.8, 0.4])
@@ -1060,7 +1341,8 @@ class TestSpatialPhase3MeshPlacer(unittest.TestCase):
             summary = align_and_place_object_meshes(
                 objects_dir=objs_dir,
                 plane_data_path=planes_json_path,
-                out_dir=out_dir
+                out_dir=out_dir,
+                enable_snapping=True,
             )
 
             self.assertEqual(len(summary), 2)
@@ -1114,7 +1396,8 @@ class TestSpatialPhase3MeshPlacer(unittest.TestCase):
             summary = align_and_place_object_meshes(
                 objects_dir=objs_dir,
                 plane_data_path=planes_json_path,
-                out_dir=out_dir
+                out_dir=out_dir,
+                enable_snapping=True,
             )
 
             self.assertEqual(len(summary), 1)
@@ -1168,7 +1451,8 @@ class TestSpatialPhase3MeshPlacer(unittest.TestCase):
             summary = align_and_place_object_meshes(
                 objects_dir=objs_dir,
                 plane_data_path=planes_json_path,
-                out_dir=out_dir
+                out_dir=out_dir,
+                enable_snapping=True,
             )
 
             self.assertEqual(len(summary), 1)
@@ -1214,8 +1498,10 @@ class TestSpatialPhase3MeshPlacer(unittest.TestCase):
             summary = align_and_place_object_meshes(
                 objects_dir=objs_dir,
                 plane_data_path=planes_json_path,
-                out_dir=out_dir
+                out_dir=out_dir,
+                enable_snapping=True,
             )
+
 
             self.assertEqual(len(summary), 1)
             item = summary[0]
