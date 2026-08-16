@@ -78,8 +78,8 @@ def backproject_mask_to_3d(
     if foreground_margin > 0:
         masked_depths = depth_map[valid_mask]
         if len(masked_depths) > 10:
-            median_z = float(np.median(masked_depths))
-            max_allowed_z = median_z + foreground_margin
+            near_z = float(np.percentile(masked_depths, 15.0))
+            max_allowed_z = near_z + foreground_margin
             valid_mask = valid_mask & (depth_map <= max_allowed_z)
             if not np.any(valid_mask):
                 return np.zeros((0, 3), dtype=np.float64), None
@@ -113,9 +113,10 @@ def backproject_mask_to_3d(
 def filter_object_pointcloud_dbscan(
     pts: np.ndarray,
     colors: Optional[np.ndarray] = None,
-    eps: float = config.DBSCAN_EPS,
-    min_samples: int = config.DBSCAN_MIN_SAMPLES,
-    min_cluster_size: int = config.DBSCAN_MIN_CLUSTER_SIZE,
+    eps: float = getattr(config, "OBJECT_DBSCAN_EPS", getattr(config, "DBSCAN_EPS", 0.05)),
+    min_samples: int = getattr(config, "OBJECT_DBSCAN_MIN_SAMPLES", getattr(config, "DBSCAN_MIN_SAMPLES", 5)),
+    min_cluster_size: int = getattr(config, "OBJECT_DBSCAN_MIN_CLUSTER_SIZE", getattr(config, "DBSCAN_MIN_CLUSTER_SIZE", 15)),
+    max_merge_dist: Optional[float] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Remove noise points and isolate the dominant object cluster using DBSCAN.
@@ -150,14 +151,15 @@ def filter_object_pointcloud_dbscan(
         dominant_pts = pts[labels == dominant_label]
         dominant_centroid = np.mean(dominant_pts, axis=0)
         dominant_span = float(np.linalg.norm(np.max(dominant_pts, axis=0) - np.min(dominant_pts, axis=0)))
-        max_merge_dist = max(0.35, dominant_span * 0.40)
+        if max_merge_dist is None:
+            max_merge_dist = max(0.36, dominant_span * 0.40)
 
         selected_clusters = [dominant_label]
         for c_idx in sort_order[1:]:
             c_label = valid_clusters[c_idx]
             c_pts = pts[labels == c_label]
             c_centroid = np.mean(c_pts, axis=0)
-            # Merge if centroid is within adaptive distance threshold
+            # Merge if centroid is within tight adaptive distance threshold
             if np.linalg.norm(c_centroid - dominant_centroid) < max_merge_dist:
                 selected_clusters.append(c_label)
 
@@ -167,13 +169,20 @@ def filter_object_pointcloud_dbscan(
     return pts_clean, cols_clean
 
 
-def reconstruct_object_mesh_alpha_shape(
+def reconstruct_object_mesh(
     pts: np.ndarray,
     colors: Optional[np.ndarray] = None,
-    alpha: float = config.ALPHA_SHAPE_ALPHA,
+    method: str = getattr(config, "OBJECT_MESHING_METHOD", "bpa"),
+    alpha: Optional[float] = None,
     out_path: Optional[Path | str] = None,
 ) -> Any:
-    """Fit a 3D Alpha-Shape surface mesh around object point cloud with Convex Hull fallback."""
+    """
+    Reconstruct a high-fidelity 3D surface mesh from an object point cloud.
+    Supports:
+    - "bpa": Ball Pivoting Algorithm with 4-tier progressive ball radii (preserves holes, undercuts, hollow parts).
+    - "poisson": Screened Poisson Reconstruction with density trimming.
+    - "alpha": Alpha-Shape concavity mesh with adaptive radius.
+    """
     if len(pts) < 4:
         raise ValueError(f"[ObjectEstimator] At least 4 points needed for 3D meshing, got {len(pts)}.")
 
@@ -184,23 +193,58 @@ def reconstruct_object_mesh_alpha_shape(
         if colors is not None:
             pcd.colors = o3d.utility.Vector3dVector(colors / 255.0)
 
+        # Estimate surface normals
         try:
-            mesh_o3d = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, alpha=alpha)
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=min(25, len(pts))))
+            pcd.orient_normals_consistent_tangent_plane(k=min(25, len(pts)))
+        except Exception:
+            pass
+
+        distances = pcd.compute_nearest_neighbor_distance()
+        avg_dist = float(np.median(distances)) if len(distances) > 0 else 0.02
+        avg_dist = max(avg_dist, 0.005)
+
+        if method == "bpa":
+            try:
+                radii_mult = getattr(config, "OBJECT_BPA_RADII_MULTIPLIER", [0.8, 1.5, 3.0, 6.0])
+                radii = [avg_dist * m for m in radii_mult]
+                mesh_o3d = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+                    pcd, o3d.utility.DoubleVector(radii)
+                )
+            except Exception:
+                mesh_o3d = None
+
+        if (mesh_o3d is None or len(mesh_o3d.triangles) < 4) and method == "poisson":
+            try:
+                mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
+                densities = np.asarray(densities)
+                if len(densities) > 0:
+                    density_thresh = np.percentile(densities, 12.0)
+                    mesh_o3d.remove_vertices_by_mask(densities < density_thresh)
+            except Exception:
+                mesh_o3d = None
+
+        if mesh_o3d is None or len(mesh_o3d.triangles) < 4:
+            # Fallback to Adaptive Alpha Shape
+            try:
+                effective_alpha = alpha if alpha is not None else max(getattr(config, "ALPHA_SHAPE_ALPHA", 0.04), avg_dist * 2.5)
+                mesh_o3d = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, alpha=effective_alpha)
+            except Exception:
+                mesh_o3d = None
+
+        if mesh_o3d is not None and len(mesh_o3d.vertices) > 0 and len(mesh_o3d.triangles) > 0:
             mesh_o3d.remove_degenerate_triangles()
             mesh_o3d.remove_duplicated_triangles()
             mesh_o3d.remove_duplicated_vertices()
             mesh_o3d.remove_non_manifold_edges()
 
-            if colors is not None and len(pcd.points) > 0 and len(mesh_o3d.vertices) > 0:
+            if colors is not None and len(mesh_o3d.vertices) > 0:
                 from scipy.spatial import cKDTree
                 tree = cKDTree(pts)
                 mesh_verts = np.asarray(mesh_o3d.vertices)
                 _, indices = tree.query(mesh_verts, k=1)
                 v_cols = colors[indices] / 255.0
                 mesh_o3d.vertex_colors = o3d.utility.Vector3dVector(v_cols)
-        except Exception as exc:
-            print(f"[ObjectEstimator] Alpha Shape failed ({exc}), falling back to Convex Hull.")
-            mesh_o3d = None
 
     if mesh_o3d is not None and HAS_TRIMESH and out_path is not None and len(mesh_o3d.vertices) > 0 and len(mesh_o3d.triangles) > 0:
         out_path = Path(out_path)
@@ -210,25 +254,64 @@ def reconstruct_object_mesh_alpha_shape(
         v_cols = (np.asarray(mesh_o3d.vertex_colors) * 255).astype(np.uint8) if mesh_o3d.has_vertex_colors() else colors
         tri = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=v_cols)
         tri.export(str(out_path))
-        print(f"[ObjectEstimator] Object 3D mesh saved -> {out_path}")
-        return tri
-
-    if HAS_TRIMESH:
-        tri = trimesh.convex.convex_hull(pts)
-        if colors is not None and len(tri.vertices) > 0:
-            from scipy.spatial import cKDTree
-            tree = cKDTree(pts)
-            _, indices = tree.query(tri.vertices, k=1)
-            tri.visual.vertex_colors = colors[indices]
-
-        if out_path is not None:
-            out_path = Path(out_path)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            tri.export(str(out_path))
-            print(f"[ObjectEstimator] Object 3D mesh saved (Convex Hull) -> {out_path}")
+        print(f"[ObjectEstimator] Object 3D mesh saved ({method.upper()}) -> {out_path}")
         return tri
 
     return mesh_o3d
+
+
+# Alias for backward compatibility
+reconstruct_object_mesh_alpha_shape = reconstruct_object_mesh
+
+
+def _filter_plane_inliers(
+    pts: np.ndarray,
+    cols: Optional[np.ndarray],
+    label: str,
+    plane_data: Optional[Dict[str, Any]],
+    margin: float = getattr(config, "PLANE_SUBTRACTION_MARGIN", 0.010),
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Remove floor and tabletop plane points that may have been accidentally included in standalone object point clouds.
+    """
+    if plane_data is None or len(pts) == 0:
+        return pts, cols
+
+    label_lower = label.lower()
+    if label_lower in {"table", "desk", "floor", "rug", "carpet"}:
+        return pts, cols
+
+    keep_mask = np.ones(len(pts), dtype=bool)
+    obj_height = float(pts[:, 1].max() - pts[:, 1].min())
+
+    # 1. Floor plane subtraction: Filter points that are flush on the floor plane, only if object is tall enough
+    floor = plane_data.get("floor")
+    if floor and obj_height > 0.15:
+        floor_y = float(floor.get("mean_y", 0.0))
+        floor_pts_mask = pts[:, 1] <= (floor_y + margin)
+        if np.sum(~floor_pts_mask) >= 15:
+            keep_mask &= ~floor_pts_mask
+
+    # 2. Table plane subtraction: If chair/sofa is near a table, prune points within table slab footprint
+    tables = plane_data.get("tables", [])
+    for tp in tables:
+        t_y = float(tp.get("mean_y", 0.0))
+        min_b = tp.get("min_bound", [-1e5, t_y, -1e5])
+        max_b = tp.get("max_bound", [1e5, t_y, 1e5])
+
+        in_table_x = (min_b[0] - 0.05) <= pts[:, 0]
+        in_table_x &= pts[:, 0] <= (max_b[0] + 0.05)
+        in_table_z = (min_b[2] - 0.05) <= pts[:, 2]
+        in_table_z &= pts[:, 2] <= (max_b[2] + 0.05)
+        in_table_y = np.abs(pts[:, 1] - t_y) <= margin
+
+        table_slab_mask = in_table_x & in_table_z & in_table_y
+        if np.sum(table_slab_mask) > 0 and np.sum(~table_slab_mask & keep_mask) >= 15:
+            keep_mask &= ~table_slab_mask
+
+    pts_filtered = pts[keep_mask]
+    cols_filtered = cols[keep_mask] if cols is not None else None
+    return pts_filtered, cols_filtered
 
 
 def _build_2d_mask(view: Dict[str, Any], H: int, W: int) -> np.ndarray:
@@ -256,23 +339,10 @@ def extract_object_points_from_world_pcd_view(
     mask_2d: np.ndarray,
     K: np.ndarray,
     c2w: np.ndarray,
-    foreground_margin: float = config.OBJECT_DEPTH_FOREGROUND_MARGIN,
+    foreground_margin: float = getattr(config, "OBJECT_DEPTH_FOREGROUND_MARGIN", 0.30),
 ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """
     Project 3D world points onto a 2D camera view and select points falling inside the 2D mask.
-
-    Parameters
-    ----------
-    world_pts : (N, 3) float64 array of world-space points.
-    world_cols : Optional (N, 3) uint8 RGB colors.
-    mask_2d : (H, W) uint8 binary mask.
-    K : (3, 3) intrinsic matrix.
-    c2w : (4, 4) camera-to-world pose matrix.
-    foreground_margin : Max depth beyond median to prune background points.
-
-    Returns
-    -------
-    (selected_pts [M, 3], selected_cols [M, 3], inlier_indices [M])
     """
     if len(world_pts) == 0:
         return np.zeros((0, 3)), None, np.zeros(0, dtype=int)
@@ -314,8 +384,8 @@ def extract_object_points_from_world_pcd_view(
     # Foreground Depth Gating: Prune background surfaces behind the foreground object
     if foreground_margin > 0 and len(matched_idx) > 10:
         matched_z = Z_c[matched_idx]
-        median_z = float(np.median(matched_z))
-        fg_mask = matched_z <= (median_z + foreground_margin)
+        near_z = float(np.percentile(matched_z, 15.0))
+        fg_mask = matched_z <= (near_z + foreground_margin)
         matched_idx = matched_idx[fg_mask]
 
     selected_pts = world_pts[matched_idx]
@@ -328,6 +398,7 @@ def process_object_detections(
     raw_depths_path: Optional[Path | str] = None,
     ar_metadata_path: Optional[Path | str] = None,
     world_pcd_path: Optional[Path | str] = None,
+    plane_data_path: Optional[Path | str] = None,
     out_dir: Optional[Path | str] = None,
 ) -> Dict[str, Any]:
     """
@@ -362,6 +433,18 @@ def process_object_detections(
     if world_pcd_path is None:
         world_pcd_path = config.PROCESSED_DATA_DIR / "world_pointcloud.ply"
     world_pcd_path = Path(world_pcd_path)
+
+    if plane_data_path is None:
+        plane_data_path = config.PROCESSED_DATA_DIR / "detected_planes.json"
+    plane_data_path = Path(plane_data_path)
+
+    plane_data = None
+    if plane_data_path.exists():
+        try:
+            with open(plane_data_path, "r", encoding="utf-8") as pf:
+                plane_data = json.load(pf)
+        except Exception:
+            plane_data = None
 
     if out_dir is None:
         out_dir = config.PROCESSED_DATA_DIR / "objects"
@@ -405,7 +488,7 @@ def process_object_detections(
                     world_pts = np.asarray(cloud.vertices, dtype=np.float64)
                     if hasattr(cloud.visual, "vertex_colors") and cloud.visual.vertex_colors is not None:
                         world_cols = np.asarray(cloud.visual.vertex_colors)[:, :3].astype(np.uint8)
-            except Exception as e:
+            except Exception:
                 world_pts = None
 
         # Fallback to Open3D if trimesh failed or returned 0 points
@@ -415,7 +498,7 @@ def process_object_detections(
                 if len(pcd.points) > 0:
                     world_pts = np.asarray(pcd.points, dtype=np.float64)
                     world_cols = (np.asarray(pcd.colors) * 255).astype(np.uint8) if pcd.has_colors() else None
-            except Exception as e:
+            except Exception:
                 pass
 
         if world_pts is None or len(world_pts) == 0:
@@ -482,8 +565,23 @@ def process_object_detections(
                         all_obj_cols.append(cols_w)
 
         if use_world_pcd and matched_indices_list:
-            # Combine unique indices extracted across views
-            merged_idx = np.unique(np.concatenate(matched_indices_list))
+            # Multi-View Silhouette Consensus: When multiple views are available, prioritize points seen across views
+            all_idx_concat = np.concatenate(matched_indices_list)
+            unique_idx, counts = np.unique(all_idx_concat, return_counts=True)
+            num_views = len(matched_indices_list)
+
+            consensus_ratio = getattr(config, "OBJECT_VIEW_CONSENSUS_RATIO", 0.50)
+            if num_views >= 3:
+                min_votes = max(2, int(np.ceil(num_views * consensus_ratio)))
+                consensus_mask = counts >= min_votes
+                if np.sum(consensus_mask) >= 10:
+                    merged_idx = unique_idx[consensus_mask]
+                else:
+                    merged_idx = unique_idx
+            else:
+                # When 1 or 2 views, take Union to avoid dropping valid side facets
+                merged_idx = unique_idx
+
             concat_pts = world_pts[merged_idx]
             concat_cols = world_cols[merged_idx] if world_cols is not None else None
         elif all_obj_pts:
@@ -493,22 +591,45 @@ def process_object_detections(
             print(f"[ObjectEstimator] WARNING: Object '{obj_id}' ({label}) has 0 valid 3D points; skipping.")
             continue
 
+        # Plane Subtraction: Prune accidental inclusion of floor/tabletop points for standalone objects
+        concat_pts, concat_cols = _filter_plane_inliers(concat_pts, concat_cols, label, plane_data)
+
         # Apply DBSCAN Outlier Removal & Dominant Cluster Isolation if enabled
-        if getattr(config, "ENABLE_DBSCAN", True):
+        enable_obj_dbscan = getattr(config, "OBJECT_ENABLE_DBSCAN", getattr(config, "ENABLE_DBSCAN", True))
+        if enable_obj_dbscan:
             clean_pts, clean_cols = filter_object_pointcloud_dbscan(concat_pts, concat_cols)
         else:
             clean_pts, clean_cols = concat_pts, concat_cols
 
         if clean_pts is None or len(clean_pts) < 4:
-            print(f"[ObjectEstimator] WARNING: Object '{obj_id}' ({label}) has insufficient 3D points ({len(clean_pts) if clean_pts is not None else 0}) after DBSCAN; skipping.")
+            print(f"[ObjectEstimator] WARNING: Object '{obj_id}' ({label}) has insufficient 3D points ({len(clean_pts) if clean_pts is not None else 0}) after filtering; skipping.")
             continue
 
+        # Export raw segmented object point cloud for standalone visual inspection
+        obj_pcd_path = None
+        if getattr(config, "SAVE_OBJECT_POINTCLOUDS", True):
+            obj_pcd_path = out_dir / f"{obj_id}_{label}_pointcloud.ply"
+            if HAS_TRIMESH:
+                if clean_cols is not None:
+                    pcd_tri = trimesh.PointCloud(vertices=clean_pts, colors=clean_cols)
+                else:
+                    pcd_tri = trimesh.PointCloud(vertices=clean_pts)
+                pcd_tri.export(str(obj_pcd_path))
+            elif HAS_OPEN3D:
+                pcd_o3d = o3d.geometry.PointCloud()
+                pcd_o3d.points = o3d.utility.Vector3dVector(clean_pts)
+                if clean_cols is not None:
+                    pcd_o3d.colors = o3d.utility.Vector3dVector(clean_cols / 255.0)
+                o3d.io.write_point_cloud(str(obj_pcd_path), pcd_o3d)
+            print(f"[ObjectEstimator] Object 3D point cloud saved -> {obj_pcd_path}")
+
         obj_mesh_path = out_dir / f"{obj_id}_{label}.ply"
-        mesh = reconstruct_object_mesh_alpha_shape(clean_pts, clean_cols, out_path=obj_mesh_path)
+        mesh = reconstruct_object_mesh(clean_pts, clean_cols, out_path=obj_mesh_path)
 
         reconstructed_objects[obj_id] = {
             "label": label,
             "mesh_path": str(obj_mesh_path),
+            "pcd_path": str(obj_pcd_path) if obj_pcd_path is not None else None,
             "point_count": len(clean_pts),
             "bounds_min": clean_pts.min(axis=0).tolist(),
             "bounds_max": clean_pts.max(axis=0).tolist(),
@@ -530,17 +651,23 @@ class ObjectEstimator:
         self,
         detections_path: Optional[Path | str] = None,
         raw_depths_path: Optional[Path | str] = None,
+        ar_metadata_path: Optional[Path | str] = None,
         world_pcd_path: Optional[Path | str] = None,
+        plane_data_path: Optional[Path | str] = None,
     ):
         self.detections_path = Path(detections_path) if detections_path else config.PROCESSED_DATA_DIR / "detections.json"
         self.raw_depths_path = Path(raw_depths_path) if raw_depths_path else config.PROCESSED_DATA_DIR / "raw_depths.npz"
+        self.ar_metadata_path = Path(ar_metadata_path) if ar_metadata_path else config.PROCESSED_DATA_DIR / "ar_metadata.json"
         self.world_pcd_path = Path(world_pcd_path) if world_pcd_path else config.PROCESSED_DATA_DIR / "world_pointcloud.ply"
+        self.plane_data_path = Path(plane_data_path) if plane_data_path else config.PROCESSED_DATA_DIR / "detected_planes.json"
 
     def run(self) -> Dict[str, Any]:
         return process_object_detections(
             self.detections_path,
             raw_depths_path=self.raw_depths_path,
+            ar_metadata_path=self.ar_metadata_path,
             world_pcd_path=self.world_pcd_path,
+            plane_data_path=self.plane_data_path,
         )
 
 
@@ -552,6 +679,8 @@ if __name__ == "__main__":
                         help="Path to raw_depths.npz file")
     parser.add_argument("--world-pcd", type=str, default=str(config.PROCESSED_DATA_DIR / "world_pointcloud.ply"),
                         help="Path to world_pointcloud.ply file")
+    parser.add_argument("--planes-json", type=str, default=str(config.PROCESSED_DATA_DIR / "detected_planes.json"),
+                        help="Path to detected_planes.json file")
     parser.add_argument("--out-dir", type=str, default=str(config.PROCESSED_DATA_DIR / "objects"),
                         help="Output directory for reconstructed object 3D meshes")
     args = parser.parse_args()
@@ -560,5 +689,6 @@ if __name__ == "__main__":
         detections_path=args.detections,
         raw_depths_path=args.depths,
         world_pcd_path=args.world_pcd,
+        plane_data_path=args.planes_json,
         out_dir=args.out_dir,
     )

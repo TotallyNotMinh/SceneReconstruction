@@ -50,12 +50,19 @@ FSV_VIOLATION_RATIO    = 0.20  # Ratio threshold for free-space violation filter
 
 
 
+# ── PointcloudBuilder Whole-Scene Clustering ─────────────────────────────────
+ENABLE_DBSCAN                = False  # Disable whole-scene DBSCAN (prevents wiping disparate room components)
+DBSCAN_EPS                   = 0.08   # Whole-scene DBSCAN radius (m)
+DBSCAN_MIN_SAMPLES           = 5      # Whole-scene DBSCAN min samples
+DBSCAN_MIN_CLUSTER_SIZE      = 30     # Whole-scene DBSCAN min cluster size
+
 # ── ObjectEstimator: Back-projection & Clustering ────────────────────────────
-ENABLE_DBSCAN           = True  # Enable DBSCAN cluster outlier removal
-DBSCAN_EPS              = 0.08  # DBSCAN neighbourhood radius (m)
-DBSCAN_MIN_SAMPLES      = 5     # Minimum points to form a cluster
-DBSCAN_MIN_CLUSTER_SIZE = 30    # Minimum cluster size to keep
-OCCLUSION_MIN_CONSENSUS = 0.60  # Fraction of views a point must be visible in
+OBJECT_ENABLE_DBSCAN         = True   # Enable DBSCAN cluster outlier removal for object instances
+OBJECT_DBSCAN_EPS            = 0.05   # Object DBSCAN neighbourhood radius (m)
+OBJECT_DBSCAN_MIN_SAMPLES    = 5      # Object DBSCAN min samples
+OBJECT_DBSCAN_MIN_CLUSTER_SIZE = 15   # Object DBSCAN min cluster size
+OBJECT_VIEW_CONSENSUS_RATIO  = 0.50   # Min fraction of multi-view detections a 3D point must be observed in
+PLANE_SUBTRACTION_MARGIN     = 0.010  # Distance margin to subtract floor/tabletop plane points from objects (m)
 
 # ── RoomBuilder & RANSAC Plane Detection ──────────────────────────────────────
 RANSAC_DISTANCE_THRESH      = 0.03   # Max inlier distance for RANSAC floor/table plane extraction (m)
@@ -68,17 +75,28 @@ TABLE_MIN_HEIGHT            = 0.30   # Minimum height above floor for a surface 
 TABLE_MAX_HEIGHT            = 1.40   # Maximum height above floor for a surface to be considered a table (m)
 
 # ── ObjectEstimator & 3D Surface Meshing ─────────────────────────────────────
-ALPHA_SHAPE_ALPHA              = 0.10   # Alpha-Shape concavity parameter for 3D mesh surface generation (m)
-OBJECT_DEPTH_FOREGROUND_MARGIN = 0.35   # Max depth delta beyond median object depth to prune background bleed (m)
+OBJECT_MESHING_METHOD          = "bpa"  # 3D Meshing algorithm: "bpa" (Ball Pivoting), "poisson", "alpha"
+OBJECT_BPA_RADII_MULTIPLIER    = [0.8, 1.5, 3.0, 6.0] # 4-tier progressive ball radii multipliers based on avg point spacing
+ALPHA_SHAPE_ALPHA              = 0.04   # Default Alpha-Shape concavity parameter for fallback meshing (m)
+OBJECT_DEPTH_FOREGROUND_MARGIN = 0.30   # Max depth delta beyond 15th percentile depth to prune background bleed (m)
 OBJECT_EXTRACT_FROM_WORLD_PCD  = True   # Extract object point clouds directly from world_pointcloud.ply via 2D guidance
+SAVE_OBJECT_POINTCLOUDS        = True   # Export individual object point clouds (.ply) for visual inspection
 
-# ── RoomBuilder & Wall Meshing ───────────────────────────────────────────────
-WALL_THICKNESS                 = 0.05   # Thickness of generated wall slab meshes in meters
-ROOM_MIN_WALL_INLIERS          = 250    # Minimum inlier points required to qualify as an architectural wall plane
+# ── RoomBuilder & Background Room Meshing ────────────────────────────────────
+ROOM_RECONSTRUCTION_METHOD     = "background_mesh" # "background_mesh" (Video-accurate), "cad_slabs" (Bounding box slabs), or "both"
+ROOM_BACKGROUND_MESHING_METHOD = "poisson"         # "poisson" (Smooth inpainting of occlusion holes), "bpa", "alpha"
+ROOM_BPA_RADII_MULTIPLIER      = [0.8, 1.5, 3.0, 6.0] # 4-tier progressive ball radii multipliers for room BPA
+ROOM_OBJECT_SUBTRACTION_RADIUS = 0.025             # Spatial radius (m) around object points to prune from world point cloud
+ROOM_POISSON_DEPTH             = 9                 # Octree depth for Screened Poisson reconstruction (fine room geometry)
+ROOM_POISSON_DENSITY_TRIM      = 6.0               # Percentile of low-density vertices to trim from Poisson surface
+WALL_THICKNESS                 = 0.05              # Thickness of generated wall slab meshes in meters
+ROOM_MIN_WALL_INLIERS          = 250               # Minimum inlier points required to qualify as an architectural wall plane
+EXPORT_ROOM_CAD_SLABS          = True              # Export room_layout.obj bounding box slabs alongside background mesh
 
-# ── MeshPlacer & Surface / Wall Snapping ─────────────────────────────────────
+# ── MeshPlacer & Scene Assembly ──────────────────────────────────────────────
 SURFACE_SNAPPING_MARGIN     = 0.00   # Vertical offset margin when snapping mesh bottom to surface (m)
 WALL_SNAPPING_MARGIN        = 0.01   # Margin offset when snapping mesh onto vertical wall surface (m)
+EXPORT_FULL_SCENE           = True   # Automatically assemble full scene (room background + aligned objects) into data/output
 WALL_MOUNTED_CLASSES        = {      # Semantic labels for objects mounted on walls
     "tv", "tvmonitor", "picture", "clock", "mirror", "whiteboard", "poster", "wall_art", "screen"
 }

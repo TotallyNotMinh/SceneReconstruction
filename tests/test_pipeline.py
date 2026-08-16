@@ -281,14 +281,27 @@ class TestFilters(unittest.TestCase):
         self.assertIsNotNone(cols)
 
 
-from spatial.room_builder import detect_architectural_planes, _compute_oriented_wall_geometry
+from spatial.room_builder import (
+    detect_architectural_planes,
+    _compute_oriented_wall_geometry,
+    extract_room_background_pointcloud,
+    reconstruct_room_background_mesh,
+    build_room_background,
+)
 from spatial.object_estimator import (
     backproject_mask_to_3d,
     filter_object_pointcloud_dbscan,
     process_object_detections,
     extract_object_points_from_world_pcd_view,
+    reconstruct_object_mesh,
+    _filter_plane_inliers,
 )
-from spatial.mesh_placer import snap_mesh_to_surface, snap_mesh_to_wall, align_and_place_object_meshes
+from spatial.mesh_placer import (
+    snap_mesh_to_surface,
+    snap_mesh_to_wall,
+    align_and_place_object_meshes,
+    assemble_full_scene,
+)
 import trimesh
 import json
 
@@ -457,6 +470,95 @@ class TestSpatialPhase1RoomBuilder(unittest.TestCase):
         # base_y remains 0.50, height = 2.0 - 0.50 = 1.50
         self.assertAlmostEqual(obb_hanging["height"], 1.50, places=4)
         self.assertAlmostEqual(obb_hanging["center"][1], 1.25, places=4)
+
+    def test_extract_room_background_pointcloud(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            world_ply = Path(tmp_dir) / "world.ply"
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+            out_pcd = Path(tmp_dir) / "room_bg.ply"
+
+            # World points: 100 room points around (0, 0, 0) + 50 chair points around (2, 2, 2)
+            rng = np.random.default_rng(42)
+            room_pts = rng.uniform(-1.0, 1.0, size=(100, 3))
+            chair_pts = rng.uniform(1.9, 2.1, size=(50, 3))
+            all_pts = np.vstack([room_pts, chair_pts])
+            trimesh.PointCloud(vertices=all_pts).export(str(world_ply))
+
+            # Save object point cloud
+            chair_pcd = objs_dir / "obj_0_chair_pointcloud.ply"
+            trimesh.PointCloud(vertices=chair_pts).export(str(chair_pcd))
+
+            bg_pts, _, p_out = extract_room_background_pointcloud(
+                world_ply_path=world_ply,
+                objects_dir=objs_dir,
+                out_pcd_path=out_pcd,
+                subtraction_radius=0.05
+            )
+
+            self.assertTrue(p_out.exists())
+            self.assertEqual(len(bg_pts), 100)
+            # Ensure none of the (2, 2, 2) chair points are in the room background
+            self.assertTrue(np.all(bg_pts < 1.5))
+
+    def test_reconstruct_room_background_mesh(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_mesh = Path(tmp_dir) / "room_mesh.ply"
+            rng = np.random.default_rng(42)
+            # Create synthetic sphere points for meshing
+            u = rng.uniform(0, 2 * np.pi, 300)
+            v = rng.uniform(0, np.pi, 300)
+            x = 1.0 * np.sin(v) * np.cos(u)
+            y = 1.0 * np.sin(v) * np.sin(u)
+            z = 1.0 * np.cos(v)
+            pts = np.column_stack([x, y, z])
+            cols = rng.integers(50, 200, size=(300, 3), dtype=np.uint8)
+
+            mesh = reconstruct_room_background_mesh(
+                room_pts=pts,
+                room_cols=cols,
+                out_mesh_path=out_mesh,
+                method="poisson",
+                depth=7,
+            )
+            self.assertIsNotNone(mesh)
+            self.assertTrue(out_mesh.exists())
+            self.assertGreater(len(mesh.vertices), 0)
+
+    def test_build_room_background_orchestration(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            world_ply = Path(tmp_dir) / "world.ply"
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+            out_pcd = Path(tmp_dir) / "room_bg.ply"
+            out_mesh = Path(tmp_dir) / "room_mesh.ply"
+
+            # World points (sphere)
+            rng = np.random.default_rng(42)
+            u = rng.uniform(0, 2 * np.pi, 200)
+            v = rng.uniform(0, np.pi, 200)
+            x = 1.0 * np.sin(v) * np.cos(u)
+            y = 1.0 * np.sin(v) * np.sin(u)
+            z = 1.0 * np.cos(v)
+            room_pts = np.column_stack([x, y, z])
+            obj_pts = rng.uniform(2.0, 2.5, size=(30, 3))
+            all_pts = np.vstack([room_pts, obj_pts])
+            trimesh.PointCloud(vertices=all_pts).export(str(world_ply))
+
+            # Object point cloud
+            obj_pcd = objs_dir / "obj_1_chair_pointcloud.ply"
+            trimesh.PointCloud(vertices=obj_pts).export(str(obj_pcd))
+
+            res = build_room_background(
+                world_ply_path=world_ply,
+                objects_dir=objs_dir,
+                out_pcd_path=out_pcd,
+                out_mesh_path=out_mesh,
+                depth=6,
+            )
+            self.assertTrue(out_pcd.exists())
+            self.assertTrue(out_mesh.exists())
+            self.assertEqual(res["point_count"], 200)
 
 
 class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
@@ -641,6 +743,8 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
             self.assertIn("obj_chair", result)
             self.assertGreater(result["obj_chair"]["point_count"], 50)
             self.assertTrue(Path(result["obj_chair"]["mesh_path"]).exists())
+            self.assertIsNotNone(result["obj_chair"]["pcd_path"])
+            self.assertTrue(Path(result["obj_chair"]["pcd_path"]).exists())
             # Ensure background wall points at Z=-5.0m were pruned and only chair points near Z=-2.0m kept
             bounds_min = result["obj_chair"]["bounds_min"]
             self.assertGreater(bounds_min[2], -3.0)
@@ -711,9 +815,9 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
             with open(det_path, "w", encoding="utf-8") as f:
                 json.dump(det_data, f)
 
-            orig_dbscan = config.ENABLE_DBSCAN
+            orig_dbscan = config.OBJECT_ENABLE_DBSCAN
             try:
-                config.ENABLE_DBSCAN = False
+                config.OBJECT_ENABLE_DBSCAN = False
                 result = process_object_detections(
                     detections_path=det_path,
                     raw_depths_path=npz_path,
@@ -722,7 +826,89 @@ class TestSpatialPhase2ObjectEstimator(unittest.TestCase):
                 self.assertIn("obj_nodbscan", result)
                 self.assertGreater(result["obj_nodbscan"]["point_count"], 0)
             finally:
-                config.ENABLE_DBSCAN = orig_dbscan
+                config.OBJECT_ENABLE_DBSCAN = orig_dbscan
+
+    def test_bpa_reconstruct_object_mesh(self):
+        # Test Ball Pivoting Algorithm on a 3D point cloud
+        rng = np.random.default_rng(42)
+        # Create a sphere surface point cloud
+        u = rng.uniform(0, 2 * np.pi, 200)
+        v = rng.uniform(0, np.pi, 200)
+        x = 0.5 * np.sin(v) * np.cos(u)
+        y = 0.5 * np.sin(v) * np.sin(u)
+        z = 0.5 * np.cos(v)
+        pts = np.column_stack([x, y, z])
+
+        mesh = reconstruct_object_mesh(pts, method="bpa")
+        self.assertIsNotNone(mesh)
+        self.assertGreater(len(mesh.vertices), 0)
+        self.assertGreater(len(mesh.faces if hasattr(mesh, "faces") else mesh.triangles), 0)
+
+    def test_plane_subtraction_excludes_floor_points(self):
+        # Create points representing a chair with points on floor
+        rng = np.random.default_rng(42)
+        chair_pts = rng.uniform(-0.2, 0.2, size=(50, 3))
+        chair_pts[:, 1] = rng.uniform(0.05, 0.8, size=50) # Chair body at Y in [0.05, 0.8]
+
+        floor_pts = rng.uniform(-0.2, 0.2, size=(30, 3))
+        floor_pts[:, 1] = rng.uniform(-0.01, 0.005, size=30) # Floor points at Y <= 0.005
+
+        all_pts = np.vstack([chair_pts, floor_pts])
+
+        plane_data = {
+            "floor": {"mean_y": 0.0},
+            "tables": []
+        }
+
+        filtered_pts, _ = _filter_plane_inliers(all_pts, None, "chair", plane_data, margin=0.010)
+        self.assertEqual(len(filtered_pts), len(chair_pts))
+        self.assertTrue(np.all(filtered_pts[:, 1] > 0.010))
+
+    def test_multi_view_consensus_filtering(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pcd_path = Path(tmp_dir) / "world_pointcloud.ply"
+            npz_path = Path(tmp_dir) / "raw_depths.npz"
+            det_path = Path(tmp_dir) / "detections.json"
+            out_dir = Path(tmp_dir) / "objects"
+
+            # 150 points at chair position Z=-2.0m
+            rng = np.random.default_rng(42)
+            chair_pts = rng.uniform(-0.1, 0.1, size=(150, 3)) + np.array([0.0, 0.0, -2.0])
+            pc = trimesh.PointCloud(vertices=chair_pts)
+            pc.export(str(pcd_path))
+
+            H, W = 60, 60
+            depth_0 = np.ones((H, W), dtype=np.float32) * 2.0
+            depth_1 = np.ones((H, W), dtype=np.float32) * 2.0
+            depth_2 = np.ones((H, W), dtype=np.float32) * 2.0
+            ixt = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+            ext = np.eye(4, dtype=np.float64)
+
+            np.savez(str(npz_path), depth_0=depth_0, depth_1=depth_1, depth_2=depth_2,
+                     ixt_0=ixt, ixt_1=ixt, ixt_2=ixt, ext_0=ext, ext_1=ext, ext_2=ext)
+
+            # Object observed in 3 frames (Majority consensus test)
+            det_data = {
+                "obj_mv": {
+                    "label": "chair",
+                    "associated_views": [
+                        {"frame_index": 0, "bbox": [20, 20, 40, 40]},
+                        {"frame_index": 1, "bbox": [20, 20, 40, 40]},
+                        {"frame_index": 2, "bbox": [20, 20, 40, 40]},
+                    ]
+                }
+            }
+            with open(det_path, "w", encoding="utf-8") as f:
+                json.dump(det_data, f)
+
+            result = process_object_detections(
+                detections_path=det_path,
+                raw_depths_path=npz_path,
+                world_pcd_path=pcd_path,
+                out_dir=out_dir
+            )
+            self.assertIn("obj_mv", result)
+            self.assertGreater(result["obj_mv"]["point_count"], 30)
 
     def test_missing_raw_depths_raises_filenotfound(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1004,6 +1190,152 @@ class TestSpatialPhase3MeshPlacer(unittest.TestCase):
                 out_dir=out_dir
             )
             self.assertEqual(summary, [])
+
+    def test_assemble_full_scene(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            room_ply = Path(tmp_dir) / "room_bg.ply"
+            aligned_dir = Path(tmp_dir) / "aligned"
+            aligned_dir.mkdir()
+            out_scene = Path(tmp_dir) / "full_scene.ply"
+
+            # Create dummy room mesh box
+            room_box = trimesh.creation.box(extents=[4, 3, 4])
+            room_box.export(str(room_ply))
+
+            # Create dummy aligned chair mesh box
+            chair_box = trimesh.creation.box(extents=[0.5, 0.8, 0.5])
+            chair_ply = aligned_dir / "obj_0_chair.ply"
+            chair_box.export(str(chair_ply))
+
+            scene = assemble_full_scene(
+                room_mesh_path=room_ply,
+                aligned_objects_dir=aligned_dir,
+                out_scene_path=out_scene
+            )
+            self.assertIsNotNone(scene)
+            self.assertTrue(out_scene.exists())
+            self.assertTrue(out_scene.with_suffix(".obj").exists())
+            self.assertEqual(len(scene.vertices), len(room_box.vertices) + len(chair_box.vertices))
+
+    def test_align_and_place_ignores_pointcloud_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            objs_dir = Path(tmp_dir) / "objects"
+            objs_dir.mkdir()
+            out_dir = Path(tmp_dir) / "aligned"
+            planes_json = Path(tmp_dir) / "planes.json"
+
+            with open(planes_json, "w", encoding="utf-8") as f:
+                json.dump({"floor": {"mean_y": 0.0}, "tables": [], "walls": []}, f)
+
+            # Create 1 mesh file and 1 point cloud file
+            chair_mesh = trimesh.creation.box(extents=[0.5, 0.8, 0.5])
+            chair_mesh.export(str(objs_dir / "obj_0_chair.ply"))
+            pcd = trimesh.PointCloud(vertices=np.random.uniform(-0.2, 0.2, (50, 3)))
+            pcd.export(str(objs_dir / "obj_0_chair_pointcloud.ply"))
+
+            summary = align_and_place_object_meshes(
+                objects_dir=objs_dir,
+                plane_data_path=planes_json,
+                out_dir=out_dir
+            )
+
+            # Only the mesh should be processed, NOT the pointcloud
+            self.assertEqual(len(summary), 1)
+            self.assertEqual(summary[0]["name"], "obj_0_chair")
+            # Point cloud file should NOT be copied to objects_aligned
+            self.assertFalse((out_dir / "obj_0_chair_pointcloud.ply").exists())
+
+    def test_full_sequential_phase_1_2_3(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            proc_dir = Path(tmp_dir) / "processed"
+            proc_dir.mkdir(parents=True, exist_ok=True)
+            objs_dir = proc_dir / "objects"
+            aligned_dir = proc_dir / "objects_aligned"
+            out_dir = Path(tmp_dir) / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            world_ply = proc_dir / "world_pointcloud.ply"
+            raw_depths_npz = proc_dir / "raw_depths.npz"
+            det_json = proc_dir / "detections.json"
+            planes_json = proc_dir / "detected_planes.json"
+
+            # Create synthetic room + chair
+            rng = np.random.default_rng(42)
+            n_floor = 1000
+            fx = rng.uniform(-2, 2, n_floor)
+            fz = rng.uniform(-2, 2, n_floor)
+            fy = rng.normal(0.0, 0.005, n_floor)
+            floor_pts = np.column_stack([fx, fy, fz])
+
+            n_chair = 200
+            cx = rng.uniform(0.5, 0.9, n_chair)
+            cz = rng.uniform(0.5, 0.9, n_chair)
+            cy = rng.uniform(0.05, 0.65, n_chair)
+            chair_pts = np.column_stack([cx, cy, cz])
+
+            all_pts = np.vstack([floor_pts, chair_pts])
+            trimesh.PointCloud(vertices=all_pts).export(str(world_ply))
+
+            # Phase 1: Architectural Plane Detection
+            plane_meta = detect_architectural_planes(
+                ply_path=world_ply,
+                distance_threshold=0.04,
+                out_json=planes_json,
+            )
+            self.assertIsNotNone(plane_meta["floor"])
+            self.assertTrue(planes_json.exists())
+
+            # Phase 2: Object Estimation
+            depth_0 = np.ones((60, 60), dtype=np.float32) * 1.8
+            ixt_0 = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+            ext_0 = np.eye(4, dtype=np.float64)
+            np.savez(str(raw_depths_npz), depth_0=depth_0, ixt_0=ixt_0, ext_0=ext_0)
+
+            det_data = {
+                "obj_0": {
+                    "label": "chair",
+                    "associated_views": [
+                        {
+                            "frame_index": 0,
+                            "bbox": [10, 10, 50, 50],
+                        }
+                    ]
+                }
+            }
+            with open(det_json, "w", encoding="utf-8") as f:
+                json.dump(det_data, f)
+
+            objs_meta = process_object_detections(
+                detections_path=det_json,
+                raw_depths_path=raw_depths_npz,
+                world_pcd_path=world_ply,
+                plane_data_path=planes_json,
+                out_dir=objs_dir,
+            )
+            self.assertIn("obj_0", objs_meta)
+            self.assertTrue(Path(objs_meta["obj_0"]["pcd_path"]).exists())
+            self.assertTrue(Path(objs_meta["obj_0"]["mesh_path"]).exists())
+
+            # Phase 3: Mesh Alignment & Full Scene Assembly
+            scene_path = out_dir / "full_scene_reconstruction.ply"
+            room_bg_ply = proc_dir / "room_background_mesh.ply"
+
+            aligned_summary = align_and_place_object_meshes(
+                objects_dir=objs_dir,
+                plane_data_path=planes_json,
+                out_dir=aligned_dir,
+            )
+            self.assertEqual(len(aligned_summary), 1)
+
+            scene = assemble_full_scene(
+                room_mesh_path=room_bg_ply,
+                aligned_objects_dir=aligned_dir,
+                out_scene_path=scene_path,
+                objects_dir=objs_dir,
+                world_ply_path=world_ply,
+            )
+            self.assertIsNotNone(scene)
+            self.assertTrue(scene_path.exists())
 
 
 if __name__ == "__main__":

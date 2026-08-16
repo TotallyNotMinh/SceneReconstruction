@@ -317,15 +317,322 @@ def detect_architectural_planes(
         json.dump(result, f, indent=2)
     print(f"[RoomBuilder] Plane metadata saved -> {out_json}")
 
-    # Generate visual layout mesh (.obj)
-    if out_obj is None:
-        out_obj = config.PROCESSED_DATA_DIR / "room_layout.obj"
-    out_obj = Path(out_obj)
-    out_obj.parent.mkdir(parents=True, exist_ok=True)
-
-    _export_room_layout_mesh(result, out_obj)
+    # Generate visual layout CAD bounding box slabs if enabled
+    if getattr(config, "EXPORT_ROOM_CAD_SLABS", True):
+        if out_obj is None:
+            out_obj = config.PROCESSED_DATA_DIR / "room_layout.obj"
+        out_obj = Path(out_obj)
+        out_obj.parent.mkdir(parents=True, exist_ok=True)
+        _export_room_layout_mesh(result, out_obj)
 
     return result
+
+
+def build_room_background(
+    world_ply_path: Optional[Path | str] = None,
+    objects_dir: Optional[Path | str] = None,
+    out_pcd_path: Optional[Path | str] = None,
+    out_mesh_path: Optional[Path | str] = None,
+    subtraction_radius: float = getattr(config, "ROOM_OBJECT_SUBTRACTION_RADIUS", 0.025),
+    method: str = getattr(config, "ROOM_BACKGROUND_MESHING_METHOD", "poisson"),
+    depth: int = getattr(config, "ROOM_POISSON_DEPTH", 9),
+    density_trim: float = getattr(config, "ROOM_POISSON_DENSITY_TRIM", 6.0),
+) -> Dict[str, Any]:
+    """
+    Orchestrate video-accurate room background extraction and 3D surface reconstruction.
+    Should be called AFTER Phase 2 (Object Detection & Point Cloud Extraction) has produced objects.
+
+    Parameters
+    ----------
+    world_ply_path : Path to input world_pointcloud.ply.
+    objects_dir : Directory containing segmented object point clouds and objects_manifest.json.
+    out_pcd_path : Output path for room_background_pointcloud.ply.
+    out_mesh_path : Output path for room_background_mesh.ply.
+    subtraction_radius : Spatial radius in meters around object points to prune from world point cloud.
+    method : Surface reconstruction algorithm ("poisson", "bpa", "alpha").
+    depth : Octree depth for Poisson reconstruction.
+    density_trim : Percentile of low-density vertices to trim.
+
+    Returns
+    -------
+    Dict containing 'room_background_pcd', 'room_background_mesh', 'mesh', 'point_count'.
+    """
+    if world_ply_path is None:
+        world_ply_path = config.PROCESSED_DATA_DIR / "world_pointcloud.ply"
+    world_ply_path = Path(world_ply_path)
+
+    if objects_dir is None:
+        objects_dir = config.PROCESSED_DATA_DIR / "objects"
+    objects_dir = Path(objects_dir)
+
+    if out_pcd_path is None:
+        out_pcd_path = config.PROCESSED_DATA_DIR / "room_background_pointcloud.ply"
+    out_pcd_path = Path(out_pcd_path)
+
+    if out_mesh_path is None:
+        out_mesh_path = config.PROCESSED_DATA_DIR / "room_background_mesh.ply"
+    out_mesh_path = Path(out_mesh_path)
+
+    room_pts, room_cols, saved_pcd_path = extract_room_background_pointcloud(
+        world_ply_path=world_ply_path,
+        objects_dir=objects_dir,
+        out_pcd_path=out_pcd_path,
+        subtraction_radius=subtraction_radius,
+    )
+
+    room_mesh = reconstruct_room_background_mesh(
+        room_pts=room_pts,
+        room_cols=room_cols,
+        out_mesh_path=out_mesh_path,
+        method=method,
+        depth=depth,
+        density_trim=density_trim,
+    )
+
+    return {
+        "room_background_pcd": str(saved_pcd_path),
+        "room_background_mesh": str(out_mesh_path),
+        "mesh": room_mesh,
+        "point_count": len(room_pts),
+    }
+
+
+def extract_room_background_pointcloud(
+    world_ply_path: Optional[Path | str] = None,
+    objects_dir: Optional[Path | str] = None,
+    out_pcd_path: Optional[Path | str] = None,
+    subtraction_radius: float = getattr(config, "ROOM_OBJECT_SUBTRACTION_RADIUS", 0.025),
+) -> Tuple[np.ndarray, Optional[np.ndarray], Path]:
+    """
+    Extract the room background point cloud by removing all points belonging to segmented objects.
+    """
+    if world_ply_path is None:
+        world_ply_path = config.PROCESSED_DATA_DIR / "world_pointcloud.ply"
+    world_ply_path = Path(world_ply_path)
+
+    if not world_ply_path.exists():
+        raise FileNotFoundError(f"[RoomBuilder] World point cloud not found: {world_ply_path}")
+
+    if objects_dir is None:
+        objects_dir = config.PROCESSED_DATA_DIR / "objects"
+    objects_dir = Path(objects_dir)
+
+    if out_pcd_path is None:
+        out_pcd_path = config.PROCESSED_DATA_DIR / "room_background_pointcloud.ply"
+    out_pcd_path = Path(out_pcd_path)
+    out_pcd_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Load world point cloud with safe vertex colors
+    world_pts = None
+    world_cols = None
+    if HAS_TRIMESH:
+        try:
+            cloud = trimesh.load(str(world_ply_path))
+            if isinstance(cloud, trimesh.Scene):
+                all_v = []
+                all_c = []
+                for g in cloud.geometry.values():
+                    if hasattr(g, "vertices") and len(g.vertices) > 0:
+                        v = np.asarray(g.vertices, dtype=np.float64)
+                        all_v.append(v)
+                        if hasattr(g, "colors") and g.colors is not None and len(g.colors) == len(v):
+                            c = np.asarray(g.colors)[:, :3].astype(np.uint8)
+                        elif hasattr(g, "visual") and hasattr(g.visual, "vertex_colors") and g.visual.vertex_colors is not None and len(g.visual.vertex_colors) == len(v):
+                            c = np.asarray(g.visual.vertex_colors)[:, :3].astype(np.uint8)
+                        else:
+                            c = np.tile([180, 180, 180], (len(v), 1)).astype(np.uint8)
+                        all_c.append(c)
+                if all_v:
+                    world_pts = np.vstack(all_v)
+                    world_cols = np.vstack(all_c)
+            elif isinstance(cloud, trimesh.PointCloud):
+                world_pts = np.asarray(cloud.vertices, dtype=np.float64)
+                if hasattr(cloud, "colors") and cloud.colors is not None and len(cloud.colors) > 0:
+                    world_cols = np.asarray(cloud.colors)[:, :3].astype(np.uint8)
+            elif isinstance(cloud, trimesh.Trimesh):
+                world_pts = np.asarray(cloud.vertices, dtype=np.float64)
+                if hasattr(cloud.visual, "vertex_colors") and cloud.visual.vertex_colors is not None:
+                    world_cols = np.asarray(cloud.visual.vertex_colors)[:, :3].astype(np.uint8)
+        except Exception:
+            world_pts = None
+
+    if (world_pts is None or len(world_pts) == 0) and HAS_OPEN3D:
+        try:
+            pcd = o3d.io.read_point_cloud(str(world_ply_path))
+            if len(pcd.points) > 0:
+                world_pts = np.asarray(pcd.points, dtype=np.float64)
+                world_cols = (np.asarray(pcd.colors) * 255).astype(np.uint8) if pcd.has_colors() else None
+        except Exception:
+            pass
+
+    if world_pts is None or len(world_pts) == 0:
+        raise ValueError(f"[RoomBuilder] Failed to load points from: {world_ply_path}")
+
+    # 2. Gather object points from objects_dir using manifest or strict pointcloud files
+    all_obj_pts_list = []
+    manifest_path = objects_dir / "objects_manifest.json"
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as mf:
+                manifest = json.load(mf)
+            for obj_id, obj_meta in manifest.items():
+                p_file = obj_meta.get("pcd_path")
+                if not p_file or not Path(p_file).exists():
+                    p_file = obj_meta.get("mesh_path")
+                if p_file and Path(p_file).exists():
+                    try:
+                        c = trimesh.load(str(p_file)) if HAS_TRIMESH else None
+                        if c is not None and hasattr(c, "vertices") and len(c.vertices) > 0:
+                            all_obj_pts_list.append(np.asarray(c.vertices, dtype=np.float64))
+                        elif HAS_OPEN3D:
+                            c_o3d = o3d.io.read_point_cloud(str(p_file))
+                            if len(c_o3d.points) > 0:
+                                all_obj_pts_list.append(np.asarray(c_o3d.points, dtype=np.float64))
+                    except Exception:
+                        pass
+        except Exception as exc:
+            print(f"[RoomBuilder] WARNING: Failed reading {manifest_path}: {exc}")
+
+    if not all_obj_pts_list and objects_dir.exists():
+        pcd_files = list(objects_dir.glob("*_pointcloud.ply"))
+        if not pcd_files:
+            # Fallback to meshes if point clouds are not found, excluding layout or scene meshes
+            pcd_files = [
+                f for f in objects_dir.glob("*.ply")
+                if not f.name.endswith("_pointcloud.ply")
+                and not f.name.startswith("room_")
+                and not f.name.startswith("full_scene")
+            ]
+
+        for pf in pcd_files:
+            try:
+                if HAS_TRIMESH:
+                    c = trimesh.load(str(pf))
+                    if hasattr(c, "vertices") and len(c.vertices) > 0:
+                        all_obj_pts_list.append(np.asarray(c.vertices, dtype=np.float64))
+                elif HAS_OPEN3D:
+                    c = o3d.io.read_point_cloud(str(pf))
+                    if len(c.points) > 0:
+                        all_obj_pts_list.append(np.asarray(c.points, dtype=np.float64))
+            except Exception:
+                pass
+
+    if all_obj_pts_list:
+        combined_obj_pts = np.vstack(all_obj_pts_list)
+        from scipy.spatial import cKDTree
+        tree = cKDTree(combined_obj_pts)
+        distances, _ = tree.query(world_pts, k=1)
+        keep_mask = distances > subtraction_radius
+        room_pts = world_pts[keep_mask]
+        room_cols = world_cols[keep_mask] if world_cols is not None else None
+        excluded_count = int(np.sum(~keep_mask))
+        print(f"[RoomBuilder] Subtracted {excluded_count:,} object points from room point cloud (radius={subtraction_radius*100:.1f}cm).")
+    else:
+        room_pts = world_pts
+        room_cols = world_cols
+        print("[RoomBuilder] No object point clouds found to subtract. Using full world point cloud.")
+
+    if HAS_TRIMESH:
+        if room_cols is not None:
+            pcd_tri = trimesh.PointCloud(vertices=room_pts, colors=room_cols)
+        else:
+            pcd_tri = trimesh.PointCloud(vertices=room_pts)
+        pcd_tri.export(str(out_pcd_path))
+    elif HAS_OPEN3D:
+        pcd_o3d = o3d.geometry.PointCloud()
+        pcd_o3d.points = o3d.utility.Vector3dVector(room_pts)
+        if room_cols is not None:
+            pcd_o3d.colors = o3d.utility.Vector3dVector(room_cols / 255.0)
+        o3d.io.write_point_cloud(str(out_pcd_path), pcd_o3d)
+
+    print(f"[RoomBuilder] Room background point cloud saved ({len(room_pts):,} pts) -> {out_pcd_path}")
+    return room_pts, room_cols, out_pcd_path
+
+
+def reconstruct_room_background_mesh(
+    room_pts: np.ndarray,
+    room_cols: Optional[np.ndarray] = None,
+    out_mesh_path: Optional[Path | str] = None,
+    method: str = getattr(config, "ROOM_BACKGROUND_MESHING_METHOD", "poisson"),
+    depth: int = getattr(config, "ROOM_POISSON_DEPTH", 9),
+    density_trim: float = getattr(config, "ROOM_POISSON_DENSITY_TRIM", 6.0),
+) -> Any:
+    """
+    Reconstruct a continuous 3D surface mesh for the video-accurate room background.
+    Uses Screened Poisson Surface Reconstruction to smoothly inpaint and close occlusion gaps.
+    """
+    if len(room_pts) < 10:
+        print("[RoomBuilder] WARNING: Insufficient room points for surface meshing.")
+        return None
+
+    if out_mesh_path is None:
+        out_mesh_path = config.PROCESSED_DATA_DIR / "room_background_mesh.ply"
+    out_mesh_path = Path(out_mesh_path)
+    out_mesh_path.parent.mkdir(parents=True, exist_ok=True)
+
+    mesh_o3d = None
+    if HAS_OPEN3D:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(room_pts)
+        if room_cols is not None:
+            pcd.colors = o3d.utility.Vector3dVector(room_cols / 255.0)
+
+        # Estimate surface normals
+        try:
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=min(30, len(room_pts))))
+            pcd.orient_normals_consistent_tangent_plane(k=min(30, len(room_pts)))
+        except Exception:
+            pass
+
+        if method == "poisson":
+            try:
+                mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
+                densities = np.asarray(densities)
+                if len(densities) > 0 and density_trim > 0:
+                    density_thresh = np.percentile(densities, density_trim)
+                    mesh_o3d.remove_vertices_by_mask(densities < density_thresh)
+            except Exception as exc:
+                print(f"[RoomBuilder] Poisson reconstruction failed ({exc}), trying BPA.")
+                mesh_o3d = None
+
+        if mesh_o3d is None or len(mesh_o3d.triangles) < 4:
+            # Fallback / method="bpa"
+            try:
+                distances = pcd.compute_nearest_neighbor_distance()
+                avg_dist = float(np.median(distances)) if len(distances) > 0 else 0.03
+                avg_dist = max(avg_dist, 0.005)
+                radii_mult = getattr(config, "ROOM_BPA_RADII_MULTIPLIER", [0.8, 1.5, 3.0, 6.0])
+                radii = [avg_dist * m for m in radii_mult]
+                mesh_o3d = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+                    pcd, o3d.utility.DoubleVector(radii)
+                )
+            except Exception:
+                mesh_o3d = None
+
+        if mesh_o3d is not None and len(mesh_o3d.vertices) > 0 and len(mesh_o3d.triangles) > 0:
+            mesh_o3d.remove_degenerate_triangles()
+            mesh_o3d.remove_duplicated_triangles()
+            mesh_o3d.remove_duplicated_vertices()
+            mesh_o3d.remove_non_manifold_edges()
+
+            if room_cols is not None and len(mesh_o3d.vertices) > 0:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(room_pts)
+                mesh_verts = np.asarray(mesh_o3d.vertices)
+                _, indices = tree.query(mesh_verts, k=1)
+                v_cols = room_cols[indices] / 255.0
+                mesh_o3d.vertex_colors = o3d.utility.Vector3dVector(v_cols)
+
+    if mesh_o3d is not None and HAS_TRIMESH and len(mesh_o3d.vertices) > 0 and len(mesh_o3d.triangles) > 0:
+        verts = np.asarray(mesh_o3d.vertices)
+        faces = np.asarray(mesh_o3d.triangles)
+        v_cols = (np.asarray(mesh_o3d.vertex_colors) * 255).astype(np.uint8) if mesh_o3d.has_vertex_colors() else room_cols
+        tri = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=v_cols)
+        tri.export(str(out_mesh_path))
+        print(f"[RoomBuilder] Video-accurate room background mesh saved ({method.upper()}) -> {out_mesh_path}")
+        return tri
+
+    return mesh_o3d
 
 
 def _export_room_layout_mesh(plane_data: Dict[str, Any], out_obj: Path):
@@ -428,15 +735,29 @@ def _export_room_layout_mesh(plane_data: Dict[str, Any], out_obj: Path):
 
 
 class RoomBuilder:
-    """Class wrapper for Architectural Plane Detection."""
+    """Class wrapper for Architectural Plane Detection & Room Reconstruction."""
 
-    def __init__(self, ply_path: Optional[Path | str] = None):
+    def __init__(self, ply_path: Optional[Path | str] = None, objects_dir: Optional[Path | str] = None):
         self.ply_path = Path(ply_path) if ply_path else config.PROCESSED_DATA_DIR / "world_pointcloud.ply"
+        self.objects_dir = Path(objects_dir) if objects_dir else config.PROCESSED_DATA_DIR / "objects"
         self.plane_data: Optional[Dict[str, Any]] = None
 
     def run(self) -> Dict[str, Any]:
         self.plane_data = detect_architectural_planes(self.ply_path)
         return self.plane_data
+
+    def build_background(
+        self,
+        out_pcd_path: Optional[Path | str] = None,
+        out_mesh_path: Optional[Path | str] = None,
+    ) -> Dict[str, Any]:
+        """Build video-accurate room background by subtracting segmented objects."""
+        return build_room_background(
+            world_ply_path=self.ply_path,
+            objects_dir=self.objects_dir,
+            out_pcd_path=out_pcd_path,
+            out_mesh_path=out_mesh_path,
+        )
 
     def get_floor_height(self) -> float:
         if self.plane_data is None:
@@ -446,7 +767,7 @@ class RoomBuilder:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Phase 1: Architectural Plane Detection via RANSAC")
+    parser = argparse.ArgumentParser(description="Phase 1: Architectural Plane Detection & Room Reconstruction")
     parser.add_argument("ply", type=str, nargs="?", default=str(config.PROCESSED_DATA_DIR / "world_pointcloud.ply"),
                         help="Input .ply point cloud file")
     parser.add_argument("--distance-thresh", type=float, default=config.RANSAC_DISTANCE_THRESH,

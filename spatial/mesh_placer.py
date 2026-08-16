@@ -193,11 +193,24 @@ def align_and_place_object_meshes(
         with open(manifest_path, "r", encoding="utf-8") as mf:
             objects_manifest = json.load(mf)
 
-    # Find object mesh files (.ply, .obj)
-    mesh_files = [
-        f for f in list(objects_dir.glob("*.ply")) + list(objects_dir.glob("*.obj"))
-        if f.name != "room_layout.obj" and not f.name.endswith(".json")
-    ]
+    # Find object mesh files (.ply, .obj), strictly excluding point clouds
+    mesh_files = []
+    if objects_manifest:
+        for obj_id, obj_meta in objects_manifest.items():
+            m_p = obj_meta.get("mesh_path")
+            if m_p and Path(m_p).exists():
+                mesh_files.append(Path(m_p))
+
+    if not mesh_files:
+        mesh_files = [
+            f for f in list(objects_dir.glob("*.ply")) + list(objects_dir.glob("*.obj"))
+            if f.name != "room_layout.obj"
+            and not f.name.endswith("_pointcloud.ply")
+            and not f.name.endswith(".json")
+            and not f.name.startswith("room_")
+            and not f.name.startswith("full_scene")
+        ]
+
     if not mesh_files:
         print(f"[MeshPlacer] No object mesh files found in '{objects_dir}'. Nothing to align.")
         return []
@@ -206,7 +219,7 @@ def align_and_place_object_meshes(
     aligned_summary: List[Dict[str, Any]] = []
 
     for m_path in mesh_files:
-        if m_path.name == "room_layout.obj" or m_path.name.endswith(".json"):
+        if m_path.name == "room_layout.obj" or m_path.name.endswith(".json") or m_path.name.endswith("_pointcloud.ply"):
             continue
 
         if HAS_TRIMESH:
@@ -330,22 +343,155 @@ def align_and_place_object_meshes(
         json.dump(aligned_summary, f, indent=2)
     print(f"[MeshPlacer] Aligned object placement manifest saved -> {manifest_out}")
 
+    # Assemble Full 3D Scene if enabled
+    if getattr(config, "EXPORT_FULL_SCENE", True):
+        try:
+            assemble_full_scene(
+                room_mesh_path=config.PROCESSED_DATA_DIR / "room_background_mesh.ply",
+                aligned_objects_dir=out_dir,
+                out_scene_path=config.OUTPUT_DIR / "full_scene_reconstruction.ply",
+                objects_dir=objects_dir,
+            )
+        except Exception as exc:
+            print(f"[MeshPlacer] WARNING: Full scene assembly skipped ({exc}).")
+
     return aligned_summary
 
 
-class MeshPlacer:
-    """Class wrapper for Support Surface Snapping."""
+def assemble_full_scene(
+    room_mesh_path: Optional[Path | str] = None,
+    aligned_objects_dir: Optional[Path | str] = None,
+    out_scene_path: Optional[Path | str] = None,
+    objects_dir: Optional[Path | str] = None,
+    world_ply_path: Optional[Path | str] = None,
+) -> Optional[Any]:
+    """
+    Assemble the complete 3D scene by combining the video-accurate room background mesh
+    with all aligned & snapped 3D object meshes.
+    Automatically orchestrates background extraction & meshing if not yet built.
+    """
+    if room_mesh_path is None:
+        room_mesh_path = config.PROCESSED_DATA_DIR / "room_background_mesh.ply"
+    room_mesh_path = Path(room_mesh_path)
 
-    def __init__(self, objects_dir: Optional[Path | str] = None, plane_data_path: Optional[Path | str] = None):
+    if aligned_objects_dir is None:
+        aligned_objects_dir = config.PROCESSED_DATA_DIR / "objects_aligned"
+    aligned_objects_dir = Path(aligned_objects_dir)
+
+    if objects_dir is None:
+        objects_dir = config.PROCESSED_DATA_DIR / "objects"
+    objects_dir = Path(objects_dir)
+
+    if world_ply_path is None:
+        world_ply_path = config.PROCESSED_DATA_DIR / "world_pointcloud.ply"
+    world_ply_path = Path(world_ply_path)
+
+    if out_scene_path is None:
+        out_scene_path = config.OUTPUT_DIR / "full_scene_reconstruction.ply"
+    out_scene_path = Path(out_scene_path)
+    out_scene_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # If room background mesh is missing, generate it now that objects are ready
+    reconstruction_method = getattr(config, "ROOM_RECONSTRUCTION_METHOD", "background_mesh")
+    if not room_mesh_path.exists() and reconstruction_method in ("background_mesh", "both") and world_ply_path.exists():
+        try:
+            from spatial.room_builder import build_room_background
+            print(f"[MeshPlacer] Room background mesh not found. Building from '{world_ply_path.name}' subtracting '{objects_dir.name}'...")
+            bg_meta = build_room_background(
+                world_ply_path=world_ply_path,
+                objects_dir=objects_dir,
+                out_mesh_path=room_mesh_path,
+            )
+            if bg_meta.get("mesh") is not None:
+                print(f"[MeshPlacer] Video-accurate room background mesh built successfully.")
+        except Exception as exc:
+            print(f"[MeshPlacer] WARNING: Auto background room construction failed: {exc}")
+
+    # Fallback to CAD layout if background mesh is still missing
+    if not room_mesh_path.exists():
+        cad_layout = config.PROCESSED_DATA_DIR / "room_layout.obj"
+        if cad_layout.exists():
+            room_mesh_path = cad_layout
+
+    if not HAS_TRIMESH:
+        print("[MeshPlacer] trimesh not available; skipping full scene assembly.")
+        return None
+
+    scene_components: List[trimesh.Trimesh] = []
+
+    # 1. Load Room Background Mesh
+    if room_mesh_path.exists():
+        try:
+            r_mesh = trimesh.load(str(room_mesh_path))
+            if isinstance(r_mesh, trimesh.Scene):
+                dumped = [g for g in r_mesh.geometry.values() if isinstance(g, trimesh.Trimesh) and len(g.vertices) > 0]
+                if dumped:
+                    r_mesh = trimesh.util.concatenate(dumped)
+            if isinstance(r_mesh, trimesh.Trimesh) and len(r_mesh.vertices) > 0:
+                scene_components.append(r_mesh)
+                print(f"[MeshPlacer] Included room background mesh ({len(r_mesh.vertices):,} vertices) in full scene.")
+        except Exception as exc:
+            print(f"[MeshPlacer] WARNING: Could not load room mesh {room_mesh_path}: {exc}")
+
+    # 2. Load Aligned & Snapped Object Meshes
+    if aligned_objects_dir.exists():
+        obj_plys = [
+            f for f in list(aligned_objects_dir.glob("*.ply")) + list(aligned_objects_dir.glob("*.obj"))
+            if not f.name.endswith("_pointcloud.ply")
+            and not f.name.endswith(".json")
+            and not f.name.startswith("room_")
+            and not f.name.startswith("full_scene")
+        ]
+        for op in obj_plys:
+            try:
+                o_mesh = trimesh.load(str(op))
+                if isinstance(o_mesh, trimesh.Scene):
+                    dumped = [g for g in o_mesh.geometry.values() if isinstance(g, trimesh.Trimesh) and len(g.vertices) > 0]
+                    if dumped:
+                        o_mesh = trimesh.util.concatenate(dumped)
+                if isinstance(o_mesh, trimesh.Trimesh) and len(o_mesh.vertices) > 0:
+                    scene_components.append(o_mesh)
+            except Exception as exc:
+                print(f"[MeshPlacer] WARNING: Could not load aligned object {op}: {exc}")
+
+    if not scene_components:
+        print("[MeshPlacer] No components found to assemble full scene.")
+        return None
+
+    full_scene = trimesh.util.concatenate(scene_components)
+    full_scene.export(str(out_scene_path))
+    print(f"[MeshPlacer] Full 3D scene assembled ({len(full_scene.vertices):,} vertices, {len(full_scene.faces):,} faces) -> {out_scene_path}")
+
+    # Also export .obj format for universal 3D viewer compatibility
+    out_obj_path = out_scene_path.with_suffix(".obj")
+    try:
+        full_scene.export(str(out_obj_path))
+        print(f"[MeshPlacer] Full 3D scene exported (.obj) -> {out_obj_path}")
+    except Exception:
+        pass
+
+    return full_scene
+
+
+class MeshPlacer:
+    """Class wrapper for Support Surface Snapping & Scene Assembly."""
+
+    def __init__(
+        self,
+        objects_dir: Optional[Path | str] = None,
+        plane_data_path: Optional[Path | str] = None,
+        room_mesh_path: Optional[Path | str] = None,
+    ):
         self.objects_dir = Path(objects_dir) if objects_dir else config.PROCESSED_DATA_DIR / "objects"
         self.plane_data_path = Path(plane_data_path) if plane_data_path else config.PROCESSED_DATA_DIR / "detected_planes.json"
+        self.room_mesh_path = Path(room_mesh_path) if room_mesh_path else config.PROCESSED_DATA_DIR / "room_background_mesh.ply"
 
     def run(self) -> List[Dict[str, Any]]:
         return align_and_place_object_meshes(self.objects_dir, self.plane_data_path)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Phase 3: Support Surface Snapping & Spatial Alignment")
+    parser = argparse.ArgumentParser(description="Phase 3: Support Surface Snapping & Scene Assembly")
     parser.add_argument("--objects-dir", type=str, default=str(config.PROCESSED_DATA_DIR / "objects"),
                         help="Input directory containing object 3D meshes")
     parser.add_argument("--planes-json", type=str, default=str(config.PROCESSED_DATA_DIR / "detected_planes.json"),
