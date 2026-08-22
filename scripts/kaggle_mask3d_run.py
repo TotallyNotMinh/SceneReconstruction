@@ -1,20 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-scripts/kaggle_mask3d_run.py — Standalone Mask3D Kaggle GPU Object Extractor.
+scripts/kaggle_mask3d_run.py — Official JonasSchult/Mask3D Kaggle GPU Inference Script.
 
-Run this script on Kaggle (with GPU enabled) to extract every individual object
-(table, chairs, monitor/TV on wall, sofa, bed, etc.) directly from `world_pointcloud.ply`.
+Extracts individual 3D point clouds for ALL physical objects in the room:
+- Table / Desk -> obj_001_table_pointcloud.ply
+- Individual Chairs -> obj_002_chair_pointcloud.ply, obj_003_chair_pointcloud.ply, etc.
+- Monitor / TV on Wall -> obj_005_monitor_pointcloud.ply
 
-Features:
-1. Automatically sets up MinkowskiEngine & official Mask3D model.
-2. Performs 3D neural instance segmentation on the entire room point cloud.
-3. Automatically saves each object into its own .ply file:
-   - obj_001_table_pointcloud.ply
-   - obj_002_chair_pointcloud.ply
-   - obj_003_chair_pointcloud.ply
-   - obj_004_chair_pointcloud.ply
-   - obj_005_monitor_pointcloud.ply
-4. Exports `objects_manifest.json` for Phase 2B (Meshing) and Phase 3 (Assembly).
+How to run in a Kaggle GPU Notebook (T4 / P100 / A100):
+-------------------------------------------------------
+Cell 1 (Setup dependencies):
+    !pip install -q ninja
+    !pip install -q torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
+    !pip install -q MinkowskiEngine -v --no-deps
+    !git clone https://github.com/JonasSchult/Mask3D.git
+
+Cell 2 (Download Official ScanNet200 Benchmark Checkpoint):
+    !mkdir -p weights
+    !wget https://omnomnom.vision.rwth-aachen.de/data/mask3d/checkpoints/scannet200/scannet200_benchmark.ckpt -O weights/mask3d_scannet200_benchmark.ckpt
+
+Cell 3 (Execute Object Extraction):
+    !python scripts/kaggle_mask3d_run.py --world-pcd data/processed/world_pointcloud.ply
 """
 
 import sys
@@ -26,6 +32,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# Add cloned Mask3D directory to sys.path
+for cand_dir in [PROJECT_ROOT / "Mask3D", Path("Mask3D"), Path("/kaggle/working/Mask3D")]:
+    if cand_dir.exists() and str(cand_dir) not in sys.path:
+        sys.path.insert(0, str(cand_dir))
 
 import argparse
 import numpy as np
@@ -51,13 +62,15 @@ def download_mask3d_checkpoint(weights_dir: Path) -> Path:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Kaggle GPU Mask3D 3D Instance Segmentation Runner")
+    parser = argparse.ArgumentParser(description="Official JonasSchult/Mask3D 3D Instance Segmentation Runner")
     parser.add_argument("--world-pcd", type=str, default=str(config.PROCESSED_DATA_DIR / "world_pointcloud.ply"),
                         help="Path to world_pointcloud.ply file")
     parser.add_argument("--out-dir", type=str, default=str(config.PROCESSED_DATA_DIR / "objects"),
                         help="Output directory for extracted object point clouds")
     parser.add_argument("--checkpoint", type=str, default=str(config.WEIGHTS_DIR / "mask3d_scannet200_benchmark.ckpt"),
                         help="Path to Mask3D checkpoint")
+    parser.add_argument("--planes-json", type=str, default=str(config.PROCESSED_DATA_DIR / "detected_planes.json"),
+                        help="Path to detected_planes.json file")
     args = parser.parse_args()
 
     world_pcd = Path(args.world_pcd)
@@ -80,10 +93,12 @@ def main():
     print(f"[Kaggle Mask3D] Starting 3D Instance Segmentation on:")
     print(f"               Input PCD : {world_pcd.resolve()}")
     print(f"               Output Dir: {out_dir.resolve()}")
+    print(f"               Weights   : {ckpt_path}")
     print(f"=======================================================\n")
 
     results = extract_object_pointclouds(
         world_pcd_path=world_pcd,
+        plane_data_path=args.planes_json,
         checkpoint_path=ckpt_path if ckpt_path.exists() else None,
         out_dir=out_dir,
     )
@@ -91,7 +106,7 @@ def main():
     print(f"\n[Kaggle Mask3D] Segmentation finished successfully!")
     print(f"[Kaggle Mask3D] Total extracted objects: {len(results)}")
     for obj_id, obj_info in results.items():
-        print(f"  - {obj_id} ({obj_info['label']}): {obj_info['point_count']:,} points -> {Path(obj_info['pcd_path']).name}")
+        print(f"  * {obj_id} ({obj_info['label']}): {obj_info['point_count']:,} points -> {Path(obj_info['pcd_path']).name}")
 
 
 if __name__ == "__main__":
