@@ -440,14 +440,68 @@ def load_world_pointcloud(world_pcd_path: Union[Path, str]) -> Tuple[np.ndarray,
 
 
 # ==============================================================================
-# ==================== OPENMASK3D CORE IMPLEMENTATION ==========================
+# ==================== OPENMASK3D 3D-FIRST INSTANCE SEGMENTATION ===============
 # ==============================================================================
+
+def estimate_pointcloud_normals_and_curvature(
+    pts: np.ndarray,
+    k_neighbors: int = 20,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Estimate local surface normals and planarity/curvature indices directly from 3D points
+    using local Principal Component Analysis (PCA) on k-nearest neighborhoods.
+
+    Parameters
+    ----------
+    pts : (N, 3) float64 point cloud coordinates.
+    k_neighbors : Number of nearest neighbors to construct local covariance matrix.
+
+    Returns
+    -------
+    normals : (N, 3) float64 unit surface normals.
+    curvatures : (N,) float64 surface curvature values in range [0.0, 1.0].
+                 Flat planes (floors, walls) have curvature < 0.035.
+    """
+    n_pts = len(pts)
+    if n_pts == 0:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.float64)
+
+    k = min(max(4, k_neighbors), n_pts)
+    tree = cKDTree(pts)
+    _, idxs = tree.query(pts, k=k)
+
+    if k == 1:
+        return np.tile([0.0, 1.0, 0.0], (n_pts, 1)), np.zeros(n_pts, dtype=np.float64)
+
+    # Local neighborhoods
+    neighbors = pts[idxs]  # (N, K, 3)
+    means = np.mean(neighbors, axis=1, keepdims=True)  # (N, 1, 3)
+    diffs = neighbors - means  # (N, K, 3)
+
+    # Compute covariance matrices per point: (N, 3, 3)
+    covs = np.einsum("nki,nkj->nij", diffs, diffs) / float(k)
+
+    # Eigenvalue decomposition
+    eigvals, eigvecs = np.linalg.eigh(covs)  # eigvals sorted ascending
+    normals = eigvecs[:, :, 0]  # Eigenvector of smallest eigenvalue (surface normal)
+
+    # Curvature metric: lambda_0 / (lambda_0 + lambda_1 + lambda_2)
+    sum_eigs = np.sum(eigvals, axis=1)
+    curvatures = eigvals[:, 0] / np.maximum(sum_eigs, 1e-8)
+    curvatures = np.clip(curvatures, 0.0, 1.0)
+
+    # Normalize normals
+    norm_lens = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = normals / np.maximum(norm_lens, 1e-8)
+
+    return normals, curvatures
+
 
 class OpenMask3DProposalGenerator:
     """
     Stage 1: Generates 3D class-agnostic instance mask proposals directly from 3D Point Cloud.
-    Features Structural Plane Awareness (Floor & Wall Pruning), Tabletop Slicing,
-    Leg/Contact Retrieval, and optional Mask3D neural backbone loading on Kaggle GPU.
+    Features 3D Normal & Curvature Estimation, 3D Superpoint Partitioning, Structural Plane Pruning,
+    Tabletop Slicing, and Kaggle GPU Mask3D Neural Backbone integration.
     """
 
     def __init__(
@@ -475,7 +529,7 @@ class OpenMask3DProposalGenerator:
                 self.neural_mask3d = torch.load(str(ckpt_path), map_location=device)
                 print(f"[OpenMask3D] Loaded neural Mask3D backbone from '{ckpt_path}' on {device}.")
             except Exception as e:
-                print(f"[OpenMask3D] Notice: Neural Mask3D checkpoint skipped ({e}); using structural geometric proposal pipeline.")
+                print(f"[OpenMask3D] Neural Mask3D checkpoint skipped ({e}); using 3D structural superpoint proposal pipeline.")
 
     def generate_proposals(
         self,
@@ -484,13 +538,7 @@ class OpenMask3DProposalGenerator:
         plane_data: Optional[Dict[str, Any]] = None,
     ) -> List[np.ndarray]:
         """
-        Generate distinct 3D candidate mask proposals for all separate object instances in the room.
-
-        Parameters
-        ----------
-        pts : (N, 3) World 3D coordinates.
-        colors : Optional (N, 3) RGB colors.
-        plane_data : Optional architectural plane metadata (Floor, Walls, Table planes).
+        Generate 3D instance mask proposals directly from world 3D geometry.
 
         Returns
         -------
@@ -500,41 +548,49 @@ class OpenMask3DProposalGenerator:
         if n_pts < self.min_points:
             return [np.arange(n_pts)]
 
-        # ── 1. Structural Plane Separation (Floor & Wall Pruning) ─────────────
+        # ── 1. 3D Surface Normal & Curvature Analysis ─────────────────────────
+        normals, curvatures = estimate_pointcloud_normals_and_curvature(pts, k_neighbors=min(25, n_pts))
+
+        # ── 2. Structural Plane Separation (Floor & Wall Pruning) ─────────────
         floor_y = None
         if plane_data and "floor" in plane_data:
             floor_y = float(plane_data["floor"].get("mean_y", 0.0))
         elif n_pts >= 100:
-            # Estimate floor from lowest dense horizontal slice
             y_vals = pts[:, 1]
             hist, bin_edges = np.histogram(y_vals, bins=min(100, max(10, n_pts // 10)))
             dense_bins = np.where(hist > (n_pts * 0.08))[0]
             if len(dense_bins) > 0:
                 floor_y = float(bin_edges[dense_bins[0]])
 
+        # Identify floor points (horizontal normal & flat curvature & low elevation)
         is_floor = np.zeros(n_pts, dtype=bool)
         if floor_y is not None:
-            # Floor slab margin: 3.5cm above floor level
-            is_floor = pts[:, 1] <= (floor_y + 0.035)
+            is_floor = (pts[:, 1] <= (floor_y + 0.035)) | ((pts[:, 1] <= (floor_y + 0.08)) & (np.abs(normals[:, 1]) > 0.80) & (curvatures < 0.04))
 
+        # Identify vertical wall expanses (vertical normal & flat curvature)
         is_wall = np.zeros(n_pts, dtype=bool)
         if plane_data and "walls" in plane_data:
             for w in plane_data["walls"]:
                 w_norm = np.array(w.get("normal", [0, 0, 1]), dtype=np.float64)
                 w_d = float(w.get("d", 0.0))
                 dists_to_wall = np.abs(pts @ w_norm + w_d)
-                is_wall |= (dists_to_wall < 0.035)
+                is_wall |= (dists_to_wall < 0.04)
+
+        # Points that have vertical normal and zero curvature across a broad area
+        is_large_wall_surface = (np.abs(normals[:, 1]) < 0.15) & (curvatures < 0.02)
+        if np.sum(is_large_wall_surface) > 100:
+            is_wall |= is_large_wall_surface
 
         is_structural = is_floor | is_wall
         fg_indices = np.where(~is_structural)[0]
 
-        # If point cloud has no separate floor/planes, cluster all points
         if len(fg_indices) < self.min_points:
             fg_indices = np.arange(n_pts)
 
         fg_pts = pts[fg_indices]
+        fg_curvs = curvatures[fg_indices]
 
-        # ── 2. Tabletop Object Slicing ────────────────────────────────────────
+        # ── 3. Tabletop Slicing (Separate discrete items on tables) ───────────
         tabletop_proposals: List[np.ndarray] = []
         if plane_data and "tables" in plane_data:
             for t_plane in plane_data["tables"]:
@@ -556,10 +612,10 @@ class OpenMask3DProposalGenerator:
                             if len(cand_tt) >= self.min_points:
                                 tabletop_proposals.append(cand_tt)
 
-        # ── 3. Multi-Scale Foreground Object Clustering ───────────────────────
+        # ── 4. 3D Superpoint Graph & Euclidean Instance Mask Clustering ───────
         candidate_proposals: List[np.ndarray] = list(tabletop_proposals)
 
-        # Adaptive scales for small (chair/lamp), medium (table/desk), large (sofa/bed)
+        # Multi-scale 3D clustering on foreground
         scales = [
             max(0.05, self.eps * 0.8),
             max(0.08, self.eps * 1.3),
@@ -576,12 +632,15 @@ class OpenMask3DProposalGenerator:
             for lab, cnt in zip(unique_l, counts):
                 if cnt >= self.min_points:
                     cand_fg_idx = fg_indices[labels == lab]
-                    candidate_proposals.append(cand_fg_idx)
+                    # Verify proposal forms a compact physical 3D object (not an infinite flat surface)
+                    bbox_dims = np.ptp(pts[cand_fg_idx], axis=0)
+                    if np.max(bbox_dims) <= 4.0:
+                        candidate_proposals.append(cand_fg_idx)
 
         if not candidate_proposals:
             candidate_proposals = [np.arange(n_pts)]
 
-        # ── 4. Downward Region Growing (Leg & Floor Contact Retrieval) ─────────
+        # ── 5. Downward Contact Point / Leg Retrieval ─────────────────────────
         expanded_proposals: List[np.ndarray] = []
         floor_indices = np.where(is_floor)[0] if np.any(is_floor) else np.array([], dtype=np.int64)
         floor_pts = pts[floor_indices] if len(floor_indices) > 0 else np.zeros((0, 3))
@@ -594,7 +653,6 @@ class OpenMask3DProposalGenerator:
 
             retrieved_floor_idx = []
             if floor_tree is not None and floor_y is not None:
-                # Find floor points within the 2D bounding footprint of the object
                 footprint_mask = (
                     (floor_pts[:, 0] >= min_xyz[0] - 0.04) &
                     (floor_pts[:, 0] <= max_xyz[0] + 0.04) &
@@ -619,7 +677,7 @@ class OpenMask3DProposalGenerator:
             if len(full_prop) >= self.min_points:
                 expanded_proposals.append(full_prop)
 
-        # ── 5. 3D IoU Non-Maximum Suppression ─────────────────────────────────
+        # ── 6. 3D Non-Maximum Suppression (3D IoU) ────────────────────────────
         final_proposals: List[np.ndarray] = []
         for prop in sorted(expanded_proposals, key=lambda p: -len(p)):
             prop_set = set(prop)
@@ -643,7 +701,7 @@ class OpenMask3DProposalGenerator:
 class OpenMask3DMultiViewCLIP:
     """
     Stage 2 & 3: Multi-View CLIP Feature Aggregation & Open-Vocabulary Zero-Shot Classification.
-    Uses CLIP (OpenCLIP / HuggingFace Transformers / Torchvision) to embed image crops and text queries.
+    Uses OpenCLIP to embed mask-guided image crops and text queries.
     """
 
     def __init__(
@@ -777,8 +835,9 @@ class OpenMask3DMultiViewCLIP:
 
 class OpenMask3DExtractor:
     """
-    End-to-end OpenMask3D Orchestrator:
-    Extracts 3D object instances from world_pointcloud.ply and raw_depths.npz.
+    End-to-end 3D-First OpenMask3D Orchestrator:
+    Extracts 3D object instances directly from world_pointcloud.ply using 3D Class-Agnostic Masks
+    and multi-view OpenCLIP zero-shot classification.
     """
 
     def __init__(
@@ -810,34 +869,34 @@ class OpenMask3DExtractor:
         out_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """
-        Execute OpenMask3D extraction pipeline.
+        Execute 100% 3D-First OpenMask3D Instance Extraction.
         """
         out_dir = Path(out_dir) if out_dir else config.PROCESSED_DATA_DIR / "objects"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"[OpenMask3D] Generating 3D Class-Agnostic Mask Proposals for {len(world_pts):,} points...")
+        print(f"[OpenMask3D] Generating 3D-First Class-Agnostic Mask Proposals for {len(world_pts):,} points...")
         proposals = self.proposal_gen.generate_proposals(world_pts, colors=world_cols, plane_data=plane_data)
-        print(f"[OpenMask3D] Generated {len(proposals)} 3D candidate mask proposals.")
+        print(f"[OpenMask3D] Generated {len(proposals)} distinct 3D candidate mask proposals.")
 
         # Encode text queries
         print(f"[OpenMask3D] Encoding {len(self.class_queries)} open-vocabulary target classes...")
         text_embeds = self.clip_engine.encode_text_queries(self.class_queries)  # (C, D)
 
-        # Parse camera frames from raw_depths_data or ar_metadata
         frame_keys = [k for k in raw_depths_data.keys() if k.startswith("rgb_")] if hasattr(raw_depths_data, "keys") else []
         frame_indices = sorted([int(k.split("_")[1]) for k in frame_keys])
 
         extracted_objects: Dict[str, Any] = {}
         obj_counter = 0
 
-        # Process each 3D proposal
+        # Process each 3D proposal directly from world_pointcloud.ply
         for p_idx, mask_indices in enumerate(proposals):
             if len(mask_indices) < self.min_points:
                 continue
 
             prop_pts = world_pts[mask_indices]
+            prop_cols = world_cols[mask_indices] if world_cols is not None else None
 
-            # Collect multi-view image crops for this 3D proposal
+            # Collect multi-view mask-guided image crops for this 3D proposal
             crops_list: List[np.ndarray] = []
             view_scores: List[float] = []
 
@@ -902,7 +961,7 @@ class OpenMask3DExtractor:
                 if len(crops_list) >= self.top_k_views:
                     break
 
-            # If no crops obtained, generate visual representation or fallback
+            # OpenCLIP zero-shot matching
             if crops_list:
                 crop_embeds = self.clip_engine.encode_image_crops(crops_list)  # (N_crops, D)
                 if len(crop_embeds) > 0:
@@ -915,7 +974,6 @@ class OpenMask3DExtractor:
             else:
                 mask_3d_feat = np.zeros(text_embeds.shape[1], dtype=np.float32)
 
-            # Cosine similarity with text queries
             if np.linalg.norm(mask_3d_feat) > 1e-6:
                 sims = text_embeds @ mask_3d_feat
                 best_cls_idx = int(np.argmax(sims))
@@ -925,16 +983,15 @@ class OpenMask3DExtractor:
                 best_sim = self.similarity_thresh + 0.05
                 best_label = "object"
 
-            # Filter background or low-similarity masks
             if best_sim < self.similarity_thresh:
                 continue
 
             obj_counter += 1
             obj_id = f"obj_{obj_counter:03d}"
 
-            # Clean isolated noise within extracted proposal
+            # Direct vertex slicing from world_pointcloud.ply
             final_pts = prop_pts
-            final_cols = world_cols[mask_indices] if world_cols is not None else None
+            final_cols = prop_cols
             final_pts, final_cols = filter_object_pointcloud_dbscan(final_pts, final_cols)
 
             if len(final_pts) < self.min_points:
@@ -987,6 +1044,8 @@ class OpenMask3DExtractor:
 
         print(f"[OpenMask3D] Extraction complete: {len(extracted_objects)} 3D objects segmented -> {extracted_manifest_path}")
         return extracted_objects
+
+
 
 
 

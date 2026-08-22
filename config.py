@@ -75,6 +75,9 @@ ENABLE_SUPPORT_PLANE_COLOR_CONTRAST = True # Prune base contact points whose col
 OBJECT_COLOR_WEIGHT_IN_DBSCAN = 0.0025 # Color distance weighting factor in 6D XYZ+CIELAB DBSCAN clustering
 
 # ── OpenMask3D: Open-Vocabulary 3D Instance Segmentation ──────────────────────
+OPENMASK3D_FOUNDATION_MODEL  = "yolo-world" # 2D Foundation model: "yolo-world", "sam", "grounding-dino", "auto"
+OPENMASK3D_FOUNDATION_WEIGHTS= "yolov8x-worldv2.pt" # Pretrained weights for Kaggle GPU
+OPENMASK3D_FOUNDATION_CONF   = 0.15        # Minimum confidence for 2D object detection
 OPENMASK3D_CLIP_MODEL        = "ViT-B/32"  # Pretrained CLIP model: "ViT-B/32", "ViT-L/14", "ViT-L/14@336px"
 OPENMASK3D_CLIP_PRETRAINED   = "openai"    # CLIP pretrained weights source (or "laion2b_s34b_b79k")
 OPENMASK3D_SIMILARITY_THRESH = 0.18        # Minimum cosine similarity threshold for zero-shot text-mask matching
@@ -83,6 +86,7 @@ OPENMASK3D_TOP_K_VIEWS       = 10          # Number of best camera viewpoints to
 OPENMASK3D_VOXEL_SIZE        = 0.02        # Voxel grid size (m) for 3D mask proposal downsampling
 OPENMASK3D_PROPOSAL_EPS      = 0.06        # Neighborhood distance for 3D point grouping proposals (m)
 OPENMASK3D_MAX_PROPOSALS     = 60          # Maximum 3D candidate proposals to process
+
 OPENMASK3D_CLASSES           = [           # Open-vocabulary target indoor / scene classes
     "chair", "armchair", "office chair", "swivel chair", "stool",
     "table", "desk", "coffee table", "dining table", "nightstand",
