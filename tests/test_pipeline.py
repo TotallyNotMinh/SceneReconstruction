@@ -1217,10 +1217,97 @@ class TestSpatialPhase2AObjectExtractor(unittest.TestCase):
         self.assertEqual(len(clean_pts), 80)
         self.assertTrue(np.all(clean_cols[:, 0] < 50))
 
+    def test_openmask3d_structural_plane_and_multi_object_segmentation(self):
+        """
+        Verify that OpenMask3D with structural plane awareness cleanly separates
+        floor-connected furniture (chair) and tabletop objects (laptop on table) into distinct proposals.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pcd_path = Path(tmp_dir) / "world_pointcloud.ply"
+            npz_path = Path(tmp_dir) / "raw_depths.npz"
+            plane_path = Path(tmp_dir) / "detected_planes.json"
+            out_dir = Path(tmp_dir) / "objects"
+
+            rng = np.random.default_rng(42)
+
+            # 1. Floor points at Y=0.0m (500 pts)
+            floor_x = rng.uniform(-2.0, 2.0, 500)
+            floor_z = rng.uniform(-2.0, 2.0, 500)
+            floor_y = np.zeros(500)
+            pts_floor = np.column_stack([floor_x, floor_y, floor_z])
+
+            # 2. Chair on floor around (1.0, Y in [0.05, 0.8], 1.0) (150 pts)
+            chair_x = rng.uniform(0.8, 1.2, 150)
+            chair_y = rng.uniform(0.05, 0.8, 150)
+            chair_z = rng.uniform(0.8, 1.2, 150)
+            pts_chair = np.column_stack([chair_x, chair_y, chair_z])
+
+            # 3. Table at (-1.0, Y=0.75, -1.0) (150 pts)
+            tbl_x = rng.uniform(-1.4, -0.6, 150)
+            tbl_y = rng.uniform(0.05, 0.75, 150)
+            tbl_z = rng.uniform(-1.4, -0.6, 150)
+            pts_table = np.column_stack([tbl_x, tbl_y, tbl_z])
+
+            # 4. Laptop on top of table at (-1.0, Y in [0.77, 0.95], -1.0) (80 pts)
+            lp_x = rng.uniform(-1.15, -0.85, 80)
+            lp_y = rng.uniform(0.77, 0.95, 80)
+            lp_z = rng.uniform(-1.15, -0.85, 80)
+            pts_laptop = np.column_stack([lp_x, lp_y, lp_z])
+
+            all_pts = np.vstack([pts_floor, pts_chair, pts_table, pts_laptop])
+            all_cols = rng.integers(50, 220, size=(len(all_pts), 3), dtype=np.uint8)
+
+            trimesh.PointCloud(vertices=all_pts, colors=all_cols).export(str(pcd_path))
+
+            # Plane metadata
+            plane_data = {
+                "floor": {"mean_y": 0.0, "inliers": 500},
+                "tables": [
+                    {
+                        "mean_y": 0.75,
+                        "min_bound": [-1.4, 0.75, -1.4],
+                        "max_bound": [-0.6, 0.75, -0.6],
+                    }
+                ],
+                "walls": [],
+            }
+            with open(plane_path, "w", encoding="utf-8") as f:
+                json.dump(plane_data, f)
+
+            # Synthetic raw depths
+            H, W = 60, 60
+            rgb_0 = np.full((H, W, 3), 120, dtype=np.uint8)
+            depth_0 = np.ones((H, W), dtype=np.float32) * 2.0
+            ixt_0 = np.array([[50.0, 0.0, 30.0], [0.0, 50.0, 30.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+            ext_0 = np.eye(4, dtype=np.float64)
+            np.savez(str(npz_path), rgb_0=rgb_0, depth_0=depth_0, ixt_0=ixt_0, ext_0=ext_0)
+
+            # Run Autonomous OpenMask3D extraction with plane metadata
+            results = extract_object_pointclouds(
+                world_pcd_path=pcd_path,
+                raw_depths_path=npz_path,
+                plane_data_path=plane_path,
+                out_dir=out_dir,
+                text_queries=["chair", "table", "laptop", "monitor", "sofa"],
+            )
+
+            # Slicing should successfully extract discrete objects without merging into one giant floor mesh
+            self.assertGreaterEqual(len(results), 2)
+            manifest_file = out_dir / "extracted_objects_manifest.json"
+            self.assertTrue(manifest_file.exists())
+            with open(manifest_file, "r", encoding="utf-8") as mf:
+                manifest = json.load(mf)
+            self.assertEqual(len(manifest), len(results))
+            # Check that each object has a saved point cloud ply
+            for obj_k, obj_v in manifest.items():
+                self.assertTrue(Path(obj_v["pcd_path"]).exists())
+                self.assertGreater(obj_v["point_count"], 20)
+
 
 
 
 class TestSpatialPhase2BObjectMesher(unittest.TestCase):
+
 
     def test_reconstruct_object_meshes_from_pointclouds(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

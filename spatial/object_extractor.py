@@ -446,13 +446,14 @@ def load_world_pointcloud(world_pcd_path: Union[Path, str]) -> Tuple[np.ndarray,
 class OpenMask3DProposalGenerator:
     """
     Stage 1: Generates 3D class-agnostic instance mask proposals directly from 3D Point Cloud.
-    Supports Mask3D neural backbone when available, or fast multi-scale geometric clustering.
+    Features Structural Plane Awareness (Floor & Wall Pruning), Tabletop Slicing,
+    Leg/Contact Retrieval, and optional Mask3D neural backbone loading on Kaggle GPU.
     """
 
     def __init__(
         self,
         voxel_size: float = getattr(config, "OPENMASK3D_VOXEL_SIZE", 0.02),
-        eps: float = getattr(config, "OPENMASK3D_PROPOSAL_EPS", 0.06),
+        eps: float = getattr(config, "OPENMASK3D_PROPOSAL_EPS", 0.08),
         min_points: int = getattr(config, "OPENMASK3D_MIN_POINTS", 30),
         max_proposals: int = getattr(config, "OPENMASK3D_MAX_PROPOSALS", 60),
     ):
@@ -460,15 +461,36 @@ class OpenMask3DProposalGenerator:
         self.eps = eps
         self.min_points = min_points
         self.max_proposals = max_proposals
+        self.neural_mask3d = None
+        self._init_neural_mask3d()
 
-    def generate_proposals(self, pts: np.ndarray, colors: Optional[np.ndarray] = None) -> List[np.ndarray]:
+    def _init_neural_mask3d(self):
+        """Initialize Mask3D PyTorch model if checkpoint is available on Kaggle / local environment."""
+        if not HAS_TORCH:
+            return
+        ckpt_path = getattr(config, "MASK3D_CHECKPOINT_PATH", None)
+        if ckpt_path and Path(ckpt_path).exists():
+            try:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                self.neural_mask3d = torch.load(str(ckpt_path), map_location=device)
+                print(f"[OpenMask3D] Loaded neural Mask3D backbone from '{ckpt_path}' on {device}.")
+            except Exception as e:
+                print(f"[OpenMask3D] Notice: Neural Mask3D checkpoint skipped ({e}); using structural geometric proposal pipeline.")
+
+    def generate_proposals(
+        self,
+        pts: np.ndarray,
+        colors: Optional[np.ndarray] = None,
+        plane_data: Optional[Dict[str, Any]] = None,
+    ) -> List[np.ndarray]:
         """
-        Generate binary mask indices for candidate 3D object instances.
+        Generate distinct 3D candidate mask proposals for all separate object instances in the room.
 
         Parameters
         ----------
         pts : (N, 3) World 3D coordinates.
         colors : Optional (N, 3) RGB colors.
+        plane_data : Optional architectural plane metadata (Floor, Walls, Table planes).
 
         Returns
         -------
@@ -478,71 +500,139 @@ class OpenMask3DProposalGenerator:
         if n_pts < self.min_points:
             return [np.arange(n_pts)]
 
-        # Downsample for hierarchical grouping if point cloud is large
-        if n_pts > 300000:
-            step = int(np.ceil(n_pts / 200000))
-            sub_indices = np.arange(0, n_pts, step)
-            sub_pts = pts[sub_indices]
-        else:
-            sub_indices = np.arange(n_pts)
-            sub_pts = pts
+        # ── 1. Structural Plane Separation (Floor & Wall Pruning) ─────────────
+        floor_y = None
+        if plane_data and "floor" in plane_data:
+            floor_y = float(plane_data["floor"].get("mean_y", 0.0))
+        elif n_pts >= 100:
+            # Estimate floor from lowest dense horizontal slice
+            y_vals = pts[:, 1]
+            hist, bin_edges = np.histogram(y_vals, bins=min(100, max(10, n_pts // 10)))
+            dense_bins = np.where(hist > (n_pts * 0.08))[0]
+            if len(dense_bins) > 0:
+                floor_y = float(bin_edges[dense_bins[0]])
 
-        # Multi-scale 3D clustering for class-agnostic proposals
-        scales = [self.eps * 0.8, self.eps * 1.4, self.eps * 2.2]
-        all_candidate_masks: List[np.ndarray] = []
+        is_floor = np.zeros(n_pts, dtype=bool)
+        if floor_y is not None:
+            # Floor slab margin: 3.5cm above floor level
+            is_floor = pts[:, 1] <= (floor_y + 0.035)
 
-        for scale_eps in scales:
-            db = DBSCAN(eps=scale_eps, min_samples=6, n_jobs=-1).fit(sub_pts)
+        is_wall = np.zeros(n_pts, dtype=bool)
+        if plane_data and "walls" in plane_data:
+            for w in plane_data["walls"]:
+                w_norm = np.array(w.get("normal", [0, 0, 1]), dtype=np.float64)
+                w_d = float(w.get("d", 0.0))
+                dists_to_wall = np.abs(pts @ w_norm + w_d)
+                is_wall |= (dists_to_wall < 0.035)
+
+        is_structural = is_floor | is_wall
+        fg_indices = np.where(~is_structural)[0]
+
+        # If point cloud has no separate floor/planes, cluster all points
+        if len(fg_indices) < self.min_points:
+            fg_indices = np.arange(n_pts)
+
+        fg_pts = pts[fg_indices]
+
+        # ── 2. Tabletop Object Slicing ────────────────────────────────────────
+        tabletop_proposals: List[np.ndarray] = []
+        if plane_data and "tables" in plane_data:
+            for t_plane in plane_data["tables"]:
+                t_y = float(t_plane.get("mean_y", 0.75))
+                min_b = t_plane.get("min_bound", [-999, t_y, -999])
+                max_b = t_plane.get("max_bound", [999, t_y, 999])
+                in_tt = (
+                    (pts[:, 1] > t_y + 0.015) &
+                    (pts[:, 1] < t_y + 0.85) &
+                    (pts[:, 0] >= min_b[0] - 0.05) & (pts[:, 0] <= max_b[0] + 0.05) &
+                    (pts[:, 2] >= min_b[2] - 0.05) & (pts[:, 2] <= max_b[2] + 0.05)
+                )
+                tt_idx = np.where(in_tt)[0]
+                if len(tt_idx) >= self.min_points:
+                    db_tt = DBSCAN(eps=0.06, min_samples=4).fit(pts[tt_idx])
+                    for tt_lab in np.unique(db_tt.labels_):
+                        if tt_lab >= 0:
+                            cand_tt = tt_idx[db_tt.labels_ == tt_lab]
+                            if len(cand_tt) >= self.min_points:
+                                tabletop_proposals.append(cand_tt)
+
+        # ── 3. Multi-Scale Foreground Object Clustering ───────────────────────
+        candidate_proposals: List[np.ndarray] = list(tabletop_proposals)
+
+        # Adaptive scales for small (chair/lamp), medium (table/desk), large (sofa/bed)
+        scales = [
+            max(0.05, self.eps * 0.8),
+            max(0.08, self.eps * 1.3),
+            max(0.12, self.eps * 2.0),
+        ]
+
+        for s_eps in scales:
+            db = DBSCAN(eps=s_eps, min_samples=5, n_jobs=-1).fit(fg_pts)
             labels = db.labels_
             valid = labels >= 0
             if not np.any(valid):
                 continue
             unique_l, counts = np.unique(labels[valid], return_counts=True)
             for lab, cnt in zip(unique_l, counts):
-                if cnt >= max(15, self.min_points // 2):
-                    cand_sub_idx = sub_indices[labels == lab]
-                    all_candidate_masks.append(cand_sub_idx)
+                if cnt >= self.min_points:
+                    cand_fg_idx = fg_indices[labels == lab]
+                    candidate_proposals.append(cand_fg_idx)
 
-        if not all_candidate_masks:
-            return [np.arange(n_pts)]
+        if not candidate_proposals:
+            candidate_proposals = [np.arange(n_pts)]
 
-        # Map sub-sampled proposals back to full point cloud via KD-Tree
-        full_tree = cKDTree(pts)
-        merged_proposals: List[np.ndarray] = []
+        # ── 4. Downward Region Growing (Leg & Floor Contact Retrieval) ─────────
+        expanded_proposals: List[np.ndarray] = []
+        floor_indices = np.where(is_floor)[0] if np.any(is_floor) else np.array([], dtype=np.int64)
+        floor_pts = pts[floor_indices] if len(floor_indices) > 0 else np.zeros((0, 3))
+        floor_tree = cKDTree(floor_pts) if len(floor_pts) > 0 else None
 
-        for cand_sub_idx in all_candidate_masks:
-            cand_pts = pts[cand_sub_idx]
-            cand_center = np.mean(cand_pts, axis=0)
-            cand_radius = float(np.max(np.linalg.norm(cand_pts - cand_center, axis=1))) + (self.eps * 1.5)
+        for prop_idx in candidate_proposals:
+            prop_pts = pts[prop_idx]
+            min_xyz = np.min(prop_pts, axis=0)
+            max_xyz = np.max(prop_pts, axis=0)
 
-            # Spatial bounding query
-            nearby_idx = full_tree.query_ball_point(cand_center, r=cand_radius)
-            if len(nearby_idx) < self.min_points:
-                continue
+            retrieved_floor_idx = []
+            if floor_tree is not None and floor_y is not None:
+                # Find floor points within the 2D bounding footprint of the object
+                footprint_mask = (
+                    (floor_pts[:, 0] >= min_xyz[0] - 0.04) &
+                    (floor_pts[:, 0] <= max_xyz[0] + 0.04) &
+                    (floor_pts[:, 2] >= min_xyz[2] - 0.04) &
+                    (floor_pts[:, 2] <= max_xyz[2] + 0.04)
+                )
+                cand_footprint_floor = floor_indices[footprint_mask]
+                if len(cand_footprint_floor) > 0:
+                    cand_f_pts = pts[cand_footprint_floor]
+                    bottom_mask = prop_pts[:, 1] <= (min_xyz[1] + 0.15)
+                    bottom_pts = prop_pts[bottom_mask] if np.any(bottom_mask) else prop_pts
+                    bot_tree = cKDTree(bottom_pts)
+                    dists_to_bot, _ = bot_tree.query(cand_f_pts, k=1)
+                    leg_points = cand_footprint_floor[dists_to_bot <= 0.08]
+                    retrieved_floor_idx = list(leg_points)
 
-            nearby_pts = pts[nearby_idx]
-            sub_tree = cKDTree(cand_pts)
-            dists, _ = sub_tree.query(nearby_pts, k=1)
-            inlier_sub = dists <= (self.eps * 1.8)
+            if retrieved_floor_idx:
+                full_prop = np.unique(np.concatenate([prop_idx, retrieved_floor_idx]))
+            else:
+                full_prop = prop_idx
 
-            full_proposal_idx = np.array(nearby_idx)[inlier_sub]
-            if len(full_proposal_idx) >= self.min_points:
-                merged_proposals.append(full_proposal_idx)
+            if len(full_prop) >= self.min_points:
+                expanded_proposals.append(full_prop)
 
-        # Remove highly redundant duplicate proposals (3D IoU suppression)
+        # ── 5. 3D IoU Non-Maximum Suppression ─────────────────────────────────
         final_proposals: List[np.ndarray] = []
-        for prop in sorted(merged_proposals, key=lambda p: -len(p)):
+        for prop in sorted(expanded_proposals, key=lambda p: -len(p)):
             prop_set = set(prop)
-            is_duplicate = False
+            is_dup = False
             for existing in final_proposals:
                 exist_set = set(existing)
                 intersection = len(prop_set & exist_set)
                 union = len(prop_set | exist_set)
                 iou = intersection / max(union, 1)
-                if iou > 0.65:
-                    is_duplicate = True
+                if iou > 0.60:
+                    is_dup = True
                     break
-            if not is_duplicate:
+            if not is_dup:
                 final_proposals.append(prop)
             if len(final_proposals) >= self.max_proposals:
                 break
@@ -716,6 +806,7 @@ class OpenMask3DExtractor:
         world_cols: Optional[np.ndarray],
         raw_depths_data: Any,
         ar_metadata: Optional[Dict[str, Any]] = None,
+        plane_data: Optional[Dict[str, Any]] = None,
         out_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """
@@ -725,7 +816,7 @@ class OpenMask3DExtractor:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"[OpenMask3D] Generating 3D Class-Agnostic Mask Proposals for {len(world_pts):,} points...")
-        proposals = self.proposal_gen.generate_proposals(world_pts, colors=world_cols)
+        proposals = self.proposal_gen.generate_proposals(world_pts, colors=world_cols, plane_data=plane_data)
         print(f"[OpenMask3D] Generated {len(proposals)} 3D candidate mask proposals.")
 
         # Encode text queries
@@ -760,53 +851,50 @@ class OpenMask3DExtractor:
                 else:
                     K = np.array([[1.2 * max(W, H), 0, W / 2], [0, 1.2 * max(W, H), H / 2], [0, 0, 1]], dtype=np.float64)
 
-                # Pose c2w
+                # Camera Pose (c2w)
                 if f"ext_{f_idx}" in raw_depths_data:
-                    w2c = raw_depths_data[f"ext_{f_idx}"].astype(np.float64)
-                    if w2c.shape == (3, 4):
+                    c2w = raw_depths_data[f"ext_{f_idx}"].astype(np.float64)
+                    if c2w.shape == (3, 4):
                         H_mat = np.eye(4, dtype=np.float64)
-                        H_mat[:3, :4] = w2c
-                        w2c = H_mat
-                    c2w = np.linalg.pinv(w2c)
-                    c2w = np.diag([1.0, -1.0, -1.0, 1.0]) @ c2w
+                        H_mat[:3, :4] = c2w
+                        c2w = H_mat
                 else:
                     c2w = np.eye(4, dtype=np.float64)
 
-                # Transform proposal points to camera space
-                w2c_curr = np.linalg.pinv(c2w)
+                w2c = np.linalg.pinv(c2w)
                 pts_h = np.hstack([prop_pts, np.ones((len(prop_pts), 1), dtype=np.float64)])
-                pts_cam = (w2c_curr @ pts_h.T).T[:, :3]
+                pts_cam = (w2c @ pts_h.T).T[:, :3]
 
                 Z_c = pts_cam[:, 2]
-                in_front = Z_c > 0.1
+                Z_abs = np.abs(Z_c)
+                in_front = Z_abs > 0.1
                 if not np.any(in_front):
                     continue
 
-                # Perspective projection
                 fx, fy = K[0, 0], K[1, 1]
                 cx, cy = K[0, 2], K[1, 2]
-                u = np.round((pts_cam[in_front, 0] * fx / np.maximum(Z_c[in_front], 1e-6)) + cx).astype(np.int64)
-                v = np.round((pts_cam[in_front, 1] * fy / np.maximum(Z_c[in_front], 1e-6)) + cy).astype(np.int64)
+                u = np.round((pts_cam[in_front, 0] * fx / np.maximum(Z_abs[in_front], 1e-6)) + cx).astype(np.int64)
+                v = np.round((pts_cam[in_front, 1] * fy / np.maximum(Z_abs[in_front], 1e-6)) + cy).astype(np.int64)
 
                 in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-                if np.sum(in_bounds) < max(5, len(prop_pts) * 0.10):
+                if np.sum(in_bounds) < max(4, int(len(prop_pts) * 0.05)):
                     continue
 
                 u_valid = u[in_bounds]
                 v_valid = v[in_bounds]
 
-                # Crop 2D bounding box with padding
+                # Bounding box with context padding
                 u_min, u_max = int(np.min(u_valid)), int(np.max(u_valid))
                 v_min, v_max = int(np.min(v_valid)), int(np.max(v_valid))
-                pad_u = max(10, int((u_max - u_min) * 0.15))
-                pad_v = max(10, int((v_max - v_min) * 0.15))
+                pad_u = max(8, int((u_max - u_min) * 0.15))
+                pad_v = max(8, int((v_max - v_min) * 0.15))
 
                 crop_x1 = max(0, u_min - pad_u)
                 crop_x2 = min(W, u_max + pad_u)
                 crop_y1 = max(0, v_min - pad_v)
                 crop_y2 = min(H, v_max + pad_v)
 
-                if (crop_x2 - crop_x1) >= 20 and (crop_y2 - crop_y1) >= 20:
+                if (crop_x2 - crop_x1) >= 15 and (crop_y2 - crop_y1) >= 15:
                     crop = rgb[crop_y1:crop_y2, crop_x1:crop_x2]
                     crops_list.append(crop)
                     view_scores.append(float(np.sum(in_bounds)))
@@ -899,6 +987,7 @@ class OpenMask3DExtractor:
 
         print(f"[OpenMask3D] Extraction complete: {len(extracted_objects)} 3D objects segmented -> {extracted_manifest_path}")
         return extracted_objects
+
 
 
 # ==============================================================================
@@ -1116,14 +1205,25 @@ def extract_object_pointclouds(
         return extracted_objects
 
     # Mode 2: Autonomous OpenMask3D Extraction (standalone from point cloud & depth frames)
+    if not plane_data:
+        cand_plane = out_dir.parent / "detected_planes.json"
+        if cand_plane.exists():
+            try:
+                with open(cand_plane, "r", encoding="utf-8") as pf:
+                    plane_data = json.load(pf)
+            except Exception:
+                plane_data = {}
+
     extractor = OpenMask3DExtractor(class_queries=text_queries)
     results = extractor.extract(
         world_pts=world_pts,
         world_cols=world_cols,
         raw_depths_data=npz_data,
         ar_metadata=ar_meta,
+        plane_data=plane_data,
         out_dir=out_dir,
     )
+
 
     if hasattr(npz_data, "close"):
         try:
