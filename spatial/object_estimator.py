@@ -33,11 +33,18 @@ from spatial.object_extractor import (
     _build_2d_mask,
 )
 
+from spatial.pointcloud_completer import (
+    PointCloudCompleter,
+    complete_object_pointclouds,
+    complete_single_pointcloud,
+)
+
 from spatial.object_mesher import (
     ObjectMesher,
     reconstruct_object_mesh,
     reconstruct_object_meshes,
 )
+
 
 # Backward compatibility alias
 reconstruct_object_mesh_alpha_shape = reconstruct_object_mesh
@@ -123,7 +130,7 @@ def process_object_detections(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[ObjectEstimator] Stage 2A: Extracting exact 3D point clouds for detected objects...")
+    print("[ObjectEstimator] Stage 2A: Extracting exact 3D point clouds for objects...")
     extracted_manifest = extract_object_pointclouds(
         detections_path=detections_path,
         raw_depths_path=raw_depths_path,
@@ -135,8 +142,22 @@ def process_object_detections(
     )
 
     if not extracted_manifest:
-        print("[ObjectEstimator] No object point clouds extracted. Skipping meshing stage.")
+        print("[ObjectEstimator] No object point clouds extracted. Skipping completion and meshing stages.")
         return {}
+
+    # Stage 2A+: Point Cloud Shape Completion (PoinTr)
+    if getattr(config, "ENABLE_POINTCLOUD_COMPLETION", True):
+        print(f"[ObjectEstimator] Stage 2A+: Completing 3D point cloud shapes with PoinTr ({len(extracted_manifest)} objects)...")
+        try:
+            completed_manifest = complete_object_pointclouds(
+                objects_dir=out_dir,
+                manifest_path=out_dir / "objects_manifest.json",
+                out_dir=out_dir,
+            )
+            if completed_manifest:
+                extracted_manifest.update(completed_manifest)
+        except Exception as e:
+            print(f"[ObjectEstimator] PoinTr completion notice: {e}; proceeding with extracted point clouds.")
 
     print(f"[ObjectEstimator] Stage 2B: Reconstructing 3D surface meshes from point clouds ({len(extracted_manifest)} objects)...")
     mesh_manifest = reconstruct_object_meshes(
@@ -144,6 +165,7 @@ def process_object_detections(
         manifest_path=out_dir / "objects_manifest.json",
         out_dir=out_dir,
     )
+
 
     return mesh_manifest
 

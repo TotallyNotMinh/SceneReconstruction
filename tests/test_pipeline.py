@@ -1191,6 +1191,33 @@ class TestSpatialPhase2AObjectExtractor(unittest.TestCase):
         self.assertEqual(len(sel_pts), 2)
         self.assertIsNone(sel_cols)
 
+    def test_6d_cielab_dbscan_separates_contact_plane(self):
+        """
+        Verify that 6D (XYZ + CIELAB) DBSCAN cleanly separates touching white floor points
+        from a dark chair leg cluster despite 0 spatial distance gap.
+        """
+        rng = np.random.default_rng(42)
+        # 80 points of black chair leg
+        chair_pts = rng.uniform(-0.04, 0.04, size=(80, 3))
+        chair_cols = np.full((80, 3), [25, 25, 25], dtype=np.uint8)
+
+        # 15 points of white floor touching the bottom of the chair leg (spatial dist ~ 0.01m)
+        floor_pts = rng.uniform(-0.04, 0.04, size=(15, 3))
+        floor_pts[:, 1] = chair_pts[:, 1].min() - 0.005 # touching base
+        floor_cols = np.full((15, 3), [230, 230, 230], dtype=np.uint8)
+
+        all_pts = np.vstack([chair_pts, floor_pts])
+        all_cols = np.vstack([chair_cols, floor_cols])
+
+        clean_pts, clean_cols = filter_object_pointcloud_dbscan(
+            all_pts, colors=all_cols, eps=0.06, min_samples=4, min_cluster_size=20
+        )
+
+        # Chair cluster must be isolated and retained (80 pts), white floor (15 pts) pruned
+        self.assertEqual(len(clean_pts), 80)
+        self.assertTrue(np.all(clean_cols[:, 0] < 50))
+
+
 
 
 class TestSpatialPhase2BObjectMesher(unittest.TestCase):

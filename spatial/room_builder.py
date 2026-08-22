@@ -13,7 +13,7 @@ import json
 import argparse
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -342,11 +342,13 @@ def build_room_background(
     objects_dir: Optional[Path | str] = None,
     out_pcd_path: Optional[Path | str] = None,
     out_mesh_path: Optional[Path | str] = None,
+    plane_data_path: Optional[Path | str] = None,
     subtraction_radius: Optional[float] = None,
     method: Optional[str] = None,
     depth: Optional[int] = None,
     density_trim: Optional[float] = None,
 ) -> Dict[str, Any]:
+
     """
     Orchestrate video-accurate room background extraction and 3D surface reconstruction.
     Should be called AFTER Phase 2 (Object Detection & Point Cloud Extraction) has produced objects.
@@ -397,6 +399,21 @@ def build_room_background(
         subtraction_radius=subtraction_radius,
     )
 
+    # 2. Architectural Inpainting: Fill floor and wall voids where objects were subtracted
+    if getattr(config, "ENABLE_ROOM_PLANE_INPAINTING", True):
+        cand1 = Path(objects_dir).parent / "detected_planes.json" if objects_dir else None
+        p_path = plane_data_path or (cand1 if (cand1 and cand1.exists()) else None)
+        if p_path and Path(p_path).exists():
+            room_pts, room_cols = inpaint_room_structural_planes(
+                room_pts=room_pts,
+                room_cols=room_cols,
+                plane_data_path=p_path,
+            )
+            if HAS_TRIMESH:
+                pcd_tri = trimesh.PointCloud(vertices=room_pts, colors=room_cols) if room_cols is not None else trimesh.PointCloud(vertices=room_pts)
+                pcd_tri.export(str(saved_pcd_path))
+
+
     room_mesh = reconstruct_room_background_mesh(
         room_pts=room_pts,
         room_cols=room_cols,
@@ -412,6 +429,7 @@ def build_room_background(
         "mesh": room_mesh,
         "point_count": len(room_pts),
     }
+
 
 
 def extract_room_background_pointcloud(
@@ -547,8 +565,6 @@ def extract_room_background_pointcloud(
     else:
         room_pts = world_pts
         room_cols = world_cols
-        print("[RoomBuilder] No object point clouds found to subtract. Using full world point cloud.")
-
     if HAS_TRIMESH:
         if room_cols is not None:
             pcd_tri = trimesh.PointCloud(vertices=room_pts, colors=room_cols)
@@ -564,6 +580,128 @@ def extract_room_background_pointcloud(
 
     print(f"[RoomBuilder] Room background point cloud saved ({len(room_pts):,} pts) -> {out_pcd_path}")
     return room_pts, room_cols, out_pcd_path
+
+
+
+def inpaint_room_structural_planes(
+    room_pts: np.ndarray,
+    room_cols: Optional[np.ndarray],
+    planes_data: Optional[Dict[str, Any]] = None,
+    plane_data_path: Optional[Union[Path, str]] = None,
+    grid_step: float = getattr(config, "ROOM_INPAINTING_GRID_STEP", 0.025),
+    gap_threshold: float = getattr(config, "ROOM_INPAINTING_GAP_THRESHOLD", 0.04),
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Inpaint dense planar points on the floor and walls where object points were subtracted.
+
+    Prevents sagging and holes in the room point cloud and surface mesh.
+    """
+    if len(room_pts) == 0:
+        return room_pts, room_cols
+
+    if planes_data is None:
+        if plane_data_path is None:
+            plane_data_path = config.PROCESSED_DATA_DIR / "detected_planes.json"
+        plane_data_path = Path(plane_data_path)
+        if plane_data_path.exists():
+            try:
+                with open(plane_data_path, "r", encoding="utf-8") as pf:
+                    planes_data = json.load(pf)
+            except Exception:
+                planes_data = {}
+        else:
+            planes_data = {}
+
+    if not planes_data:
+        return room_pts, room_cols
+
+    from scipy.spatial import cKDTree
+    room_tree = cKDTree(room_pts)
+
+    inpaint_pts_list: List[np.ndarray] = []
+    inpaint_cols_list: List[np.ndarray] = []
+
+    # 1. Inpaint Floor Plane
+    floor_info = planes_data.get("floor")
+    if floor_info:
+        floor_y = float(floor_info.get("mean_y", 0.0))
+        min_b = floor_info.get("min_bound", [-3.0, floor_y, -3.0])
+        max_b = floor_info.get("max_bound", [3.0, floor_y, 3.0])
+
+        # Find existing floor points to determine median floor color
+        floor_mask = np.abs(room_pts[:, 1] - floor_y) <= 0.04
+        if np.any(floor_mask) and room_cols is not None and len(room_cols) == len(room_pts):
+            floor_color = np.median(room_cols[floor_mask], axis=0).astype(np.uint8)
+        elif room_cols is not None and len(room_cols) > 0:
+            floor_color = np.median(room_cols, axis=0).astype(np.uint8)
+        else:
+            floor_color = np.array([190, 190, 190], dtype=np.uint8)
+
+        # Create floor grid
+        xs = np.arange(min_b[0], max_b[0], grid_step)
+        zs = np.arange(min_b[2], max_b[2], grid_step)
+        if len(xs) > 0 and len(zs) > 0:
+            xg, zg = np.meshgrid(xs, zs)
+            yg = np.full_like(xg, floor_y)
+            floor_grid_pts = np.column_stack([xg.flatten(), yg.flatten(), zg.flatten()])
+
+            # Query distance to nearest room point
+            dists, _ = room_tree.query(floor_grid_pts, k=1)
+            # A grid point is an empty void if dists >= gap_threshold
+            void_mask = (dists >= gap_threshold) & (dists <= 0.80)
+            if np.any(void_mask):
+                new_floor_pts = floor_grid_pts[void_mask]
+                inpaint_pts_list.append(new_floor_pts)
+                inpaint_cols_list.append(np.tile(floor_color, (len(new_floor_pts), 1)))
+
+    # 2. Inpaint Vertical Wall Planes
+    walls_info = planes_data.get("walls", [])
+    for wall in walls_info:
+        length = float(wall.get("length", 1.0))
+        height = float(wall.get("height", 2.0))
+        center = np.array(wall.get("center", [0, 1, 0]), dtype=np.float64)
+        u_tangent = np.array(wall.get("u_tangent", [1, 0, 0]), dtype=np.float64)
+
+        # Wall color
+        if room_cols is not None and len(room_cols) == len(room_pts):
+            wall_nearby = np.linalg.norm(room_pts - center, axis=1) <= 1.0
+            if np.any(wall_nearby):
+                wall_color = np.median(room_cols[wall_nearby], axis=0).astype(np.uint8)
+            else:
+                wall_color = np.array([210, 210, 205], dtype=np.uint8)
+        else:
+            wall_color = np.array([210, 210, 205], dtype=np.uint8)
+
+        # Create wall grid
+        u_vals = np.arange(-length / 2.0, length / 2.0, grid_step)
+        y_vals = np.arange(-height / 2.0, height / 2.0, grid_step)
+        if len(u_vals) > 0 and len(y_vals) > 0:
+            ug, yg = np.meshgrid(u_vals, y_vals)
+            ug_f = ug.flatten()
+            yg_f = yg.flatten()
+
+            wall_grid_pts = center + (ug_f[:, None] * u_tangent) + np.column_stack([np.zeros_like(yg_f), yg_f, np.zeros_like(yg_f)])
+
+            dists, _ = room_tree.query(wall_grid_pts, k=1)
+            void_mask = (dists >= gap_threshold) & (dists <= 0.60)
+            if np.any(void_mask):
+                new_wall_pts = wall_grid_pts[void_mask]
+                inpaint_pts_list.append(new_wall_pts)
+                inpaint_cols_list.append(np.tile(wall_color, (len(new_wall_pts), 1)))
+
+    if inpaint_pts_list:
+        all_inpaint_pts = np.vstack(inpaint_pts_list)
+        fused_room_pts = np.vstack([room_pts, all_inpaint_pts])
+        if room_cols is not None:
+            all_inpaint_cols = np.vstack(inpaint_cols_list)
+            fused_room_cols = np.vstack([room_cols, all_inpaint_cols])
+        else:
+            fused_room_cols = None
+        print(f"[RoomBuilder] Architectural Inpainting: Added {len(all_inpaint_pts):,} planar points to seal floor/wall voids.")
+        return fused_room_pts, fused_room_cols
+
+    return room_pts, room_cols
+
 
 
 def reconstruct_room_background_mesh(
