@@ -497,23 +497,214 @@ def estimate_pointcloud_normals_and_curvature(
     return normals, curvatures
 
 
+def detect_room_structural_planes_ransac(
+    pts: np.ndarray,
+    dist_thresh: float = 0.05,
+    max_walls: int = 6,
+) -> Tuple[np.ndarray, Optional[float], List[Dict[str, Any]]]:
+    """
+    Directly detect and separate Floor, Ceiling, and Vertical Wall planes from 3D point cloud
+    using multi-plane RANSAC to prevent wall/floor room chunks from being clustered as objects.
+
+    Returns
+    -------
+    is_structural : (N,) bool array (True for floor/wall/ceiling points).
+    floor_y : float or None (estimated floor elevation).
+    detected_planes : list of plane dicts.
+    """
+    n_pts = len(pts)
+    is_structural = np.zeros(n_pts, dtype=bool)
+    detected_planes: List[Dict[str, Any]] = []
+    if n_pts < 100:
+        return is_structural, None, detected_planes
+
+    # 1. Detect Floor Plane (lowest dense horizontal slice / RANSAC)
+    y_vals = pts[:, 1]
+    hist, bin_edges = np.histogram(y_vals, bins=min(100, max(10, n_pts // 10)))
+    dense_bins = np.where(hist > (n_pts * 0.06))[0]
+    floor_y = float(bin_edges[dense_bins[0]]) if len(dense_bins) > 0 else float(np.min(y_vals))
+
+    # Fit horizontal floor plane near floor_y
+    cand_floor_mask = np.abs(pts[:, 1] - floor_y) < (dist_thresh * 2.0)
+    if np.sum(cand_floor_mask) >= 50:
+        floor_inliers = np.where(cand_floor_mask)[0]
+        is_structural[floor_inliers] = True
+        detected_planes.append({
+            "type": "floor",
+            "normal": [0.0, 1.0, 0.0],
+            "d": -floor_y,
+            "mean_y": floor_y,
+            "inlier_count": len(floor_inliers),
+        })
+
+    # Floor slab margin (everything within 4cm of floor plane)
+    is_structural |= (pts[:, 1] <= (floor_y + 0.04))
+
+    # 2. Detect Vertical Wall Planes via Iterative RANSAC
+    rng = np.random.default_rng(42)
+    rem_indices = np.where(~is_structural)[0]
+
+    for wall_idx in range(max_walls):
+        if len(rem_indices) < 300:
+            break
+        rem_pts = pts[rem_indices]
+        n_rem = len(rem_pts)
+
+        best_inliers = None
+        best_normal = None
+        best_d = None
+        max_cnt = 0
+
+        # RANSAC sampling for vertical wall plane
+        sample_count = min(600, max(100, n_rem // 5))
+        for _ in range(sample_count):
+            sample_idx = rng.choice(n_rem, size=3, replace=False)
+            p1, p2, p3 = rem_pts[sample_idx]
+            v1 = p2 - p1
+            v2 = p3 - p1
+            norm = np.cross(v1, v2)
+            norm_len = np.linalg.norm(norm)
+            if norm_len < 1e-6:
+                continue
+            norm = norm / norm_len
+
+            # Check if plane is vertical (|n_y| < 0.20)
+            if np.abs(norm[1]) > 0.22:
+                continue
+
+            d = -float(np.dot(norm, p1))
+            dists = np.abs(rem_pts @ norm + d)
+            inliers = dists <= dist_thresh
+            cnt = int(np.sum(inliers))
+
+            if cnt > max_cnt:
+                max_cnt = cnt
+                best_inliers = inliers
+                best_normal = norm
+                best_d = d
+
+        # Accept wall if it has substantial planar coverage (>= 350 pts)
+        if best_inliers is not None and max_cnt >= max(350, int(n_pts * 0.025)):
+            wall_pt_indices = rem_indices[best_inliers]
+            is_structural[wall_pt_indices] = True
+            detected_planes.append({
+                "type": "wall",
+                "normal": best_normal.tolist(),
+                "d": best_d,
+                "inlier_count": max_cnt,
+            })
+            rem_indices = np.where(~is_structural)[0]
+        else:
+            break
+
+    return is_structural, floor_y, detected_planes
+
+
+def is_valid_3d_physical_object(
+    prop_pts: np.ndarray,
+    min_points: int = getattr(config, "OPENMASK3D_MIN_POINTS", 80),
+    max_points: int = getattr(config, "OPENMASK3D_MAX_POINTS", 35000),
+) -> bool:
+    """
+    Validate that a 3D point cloud proposal has the bounding geometry of a standalone physical object,
+    and is not a massive wall/floor slab or tiny scattered noise.
+    """
+    n_pts = len(prop_pts)
+    if n_pts < min_points or n_pts > max_points:
+        return False
+
+    bbox_dims = np.ptp(prop_pts, axis=0)  # [dx, dy, dz]
+    d_sorted = np.sort(bbox_dims)
+    d_min, d_mid, d_max = float(d_sorted[0]), float(d_sorted[1]), float(d_sorted[2])
+
+    # Reject large room slabs (e.g. wall/floor spanning entire room boundaries)
+    if d_max > 2.8 and d_mid > 1.8:
+        return False
+
+    # Reject thin planar wall surfaces (e.g. 2.2m x 1.5m with <12cm thickness and >2,500 pts)
+    if d_max > 2.0 and d_mid > 1.2 and d_min < 0.12 and n_pts > 2500:
+        return False
+
+    # Reject flat infinite floors (width & depth > 2.5m, height < 0.15m)
+    if bbox_dims[0] > 2.5 and bbox_dims[2] > 2.5 and bbox_dims[1] < 0.20:
+        return False
+
+    return True
+
+
+def validate_geometric_class_consistency(
+    label: str,
+    prop_pts: np.ndarray,
+    floor_y: Optional[float] = None,
+) -> bool:
+    """
+    Perform semantic-geometric consistency check to verify if the physical 3D dimensions
+    and position of the proposal match the predicted class (e.g. monitor, table, chair).
+    """
+    bbox_dims = np.ptp(prop_pts, axis=0)  # [dx, dy, dz]
+    width = float(max(bbox_dims[0], bbox_dims[2]))
+    depth = float(min(bbox_dims[0], bbox_dims[2]))
+    height = float(bbox_dims[1])
+    n_pts = len(prop_pts)
+
+    y_min = float(np.min(prop_pts[:, 1]))
+    h_above_floor = (y_min - floor_y) if floor_y is not None else 0.5
+
+    label_lower = label.lower()
+
+    # 1. Monitor / TV / Laptop / Screen
+    if any(k in label_lower for k in ["monitor", "screen", "display", "tv"]):
+        # A monitor cannot be 77k points or span 3.0 meters
+        if width > 1.8 or height > 1.3 or depth > 0.60 or n_pts > 20000:
+            return False
+        # A monitor cannot rest flat directly on the room floor
+        if floor_y is not None and h_above_floor < 0.25 and height < 0.30:
+            return False
+
+    # 2. Mouse / Cup / Bottle / Small Items
+    if any(k in label_lower for k in ["mouse", "cup", "bottle", "keyboard", "plate", "bowl", "book"]):
+        if max(width, height, depth) > 0.45 or n_pts > 3000:
+            return False
+        if floor_y is not None and h_above_floor < 0.35:
+            return False
+
+    # 3. Table / Desk / Coffee Table
+    if any(k in label_lower for k in ["table", "desk", "counter"]):
+        if width < 0.40 or height > 1.5 or height < 0.30:
+            return False
+
+    # 4. Chair / Office Chair / Swivel Chair
+    if any(k in label_lower for k in ["chair", "stool", "armchair"]):
+        if width > 1.2 or width < 0.30 or height > 1.6 or height < 0.40:
+            return False
+
+    # 5. Door / Blind / Window
+    if any(k in label_lower for k in ["door", "blind", "window"]):
+        if height < 0.80:
+            return False
+
+    return True
+
+
 class OpenMask3DProposalGenerator:
     """
     Stage 1: Generates 3D class-agnostic instance mask proposals directly from 3D Point Cloud.
-    Features 3D Normal & Curvature Estimation, 3D Superpoint Partitioning, Structural Plane Pruning,
-    Tabletop Slicing, and Kaggle GPU Mask3D Neural Backbone integration.
+    Features Built-In RANSAC Structural Plane Separation, 3D Normal & Curvature Estimation,
+    Physical Object Geometry Verification, Tabletop Slicing, and Kaggle GPU Mask3D integration.
     """
 
     def __init__(
         self,
         voxel_size: float = getattr(config, "OPENMASK3D_VOXEL_SIZE", 0.02),
-        eps: float = getattr(config, "OPENMASK3D_PROPOSAL_EPS", 0.08),
-        min_points: int = getattr(config, "OPENMASK3D_MIN_POINTS", 30),
+        eps: float = getattr(config, "OPENMASK3D_PROPOSAL_EPS", 0.06),
+        min_points: int = getattr(config, "OPENMASK3D_MIN_POINTS", 80),
+        max_points: int = getattr(config, "OPENMASK3D_MAX_POINTS", 35000),
         max_proposals: int = getattr(config, "OPENMASK3D_MAX_PROPOSALS", 60),
     ):
         self.voxel_size = voxel_size
         self.eps = eps
         self.min_points = min_points
+        self.max_points = max_points
         self.max_proposals = max_proposals
         self.neural_mask3d = None
         self._init_neural_mask3d()
@@ -538,7 +729,7 @@ class OpenMask3DProposalGenerator:
         plane_data: Optional[Dict[str, Any]] = None,
     ) -> List[np.ndarray]:
         """
-        Generate 3D instance mask proposals directly from world 3D geometry.
+        Generate 3D instance mask proposals directly from world 3D geometry with RANSAC plane separation.
 
         Returns
         -------
@@ -548,49 +739,40 @@ class OpenMask3DProposalGenerator:
         if n_pts < self.min_points:
             return [np.arange(n_pts)]
 
-        # ── 1. 3D Surface Normal & Curvature Analysis ─────────────────────────
+        # ── 1. Built-in Multi-Plane RANSAC (Floor, Ceiling, and 4 Walls) ──────
+        is_structural, floor_y, detected_planes = detect_room_structural_planes_ransac(
+            pts, dist_thresh=0.05, max_walls=6
+        )
+
+        # Merge with provided plane_data if available
+        if plane_data:
+            if "floor" in plane_data and plane_data["floor"].get("mean_y") is not None:
+                floor_y = float(plane_data["floor"]["mean_y"])
+                is_structural |= (pts[:, 1] <= (floor_y + 0.04))
+            if "walls" in plane_data:
+                for w in plane_data["walls"]:
+                    w_norm = np.array(w.get("normal", [0, 0, 1]), dtype=np.float64)
+                    w_d = float(w.get("d", 0.0))
+                    dists_to_wall = np.abs(pts @ w_norm + w_d)
+                    is_structural |= (dists_to_wall < 0.05)
+
+        # ── 2. 3D Surface Normal & Curvature Analysis on Non-Structural Points ─
         normals, curvatures = estimate_pointcloud_normals_and_curvature(pts, k_neighbors=min(25, n_pts))
 
-        # ── 2. Structural Plane Separation (Floor & Wall Pruning) ─────────────
-        floor_y = None
-        if plane_data and "floor" in plane_data:
-            floor_y = float(plane_data["floor"].get("mean_y", 0.0))
-        elif n_pts >= 100:
-            y_vals = pts[:, 1]
-            hist, bin_edges = np.histogram(y_vals, bins=min(100, max(10, n_pts // 10)))
-            dense_bins = np.where(hist > (n_pts * 0.08))[0]
-            if len(dense_bins) > 0:
-                floor_y = float(bin_edges[dense_bins[0]])
-
-        # Identify floor points (horizontal normal & flat curvature & low elevation)
-        is_floor = np.zeros(n_pts, dtype=bool)
-        if floor_y is not None:
-            is_floor = (pts[:, 1] <= (floor_y + 0.035)) | ((pts[:, 1] <= (floor_y + 0.08)) & (np.abs(normals[:, 1]) > 0.80) & (curvatures < 0.04))
-
-        # Identify vertical wall expanses (vertical normal & flat curvature)
-        is_wall = np.zeros(n_pts, dtype=bool)
-        if plane_data and "walls" in plane_data:
-            for w in plane_data["walls"]:
-                w_norm = np.array(w.get("normal", [0, 0, 1]), dtype=np.float64)
-                w_d = float(w.get("d", 0.0))
-                dists_to_wall = np.abs(pts @ w_norm + w_d)
-                is_wall |= (dists_to_wall < 0.04)
-
-        # Points that have vertical normal and zero curvature across a broad area
-        is_large_wall_surface = (np.abs(normals[:, 1]) < 0.15) & (curvatures < 0.02)
+        # Additional pruning for any large planar wall slabs that escaped RANSAC
+        is_large_wall_surface = (np.abs(normals[:, 1]) < 0.18) & (curvatures < 0.025)
         if np.sum(is_large_wall_surface) > 100:
-            is_wall |= is_large_wall_surface
+            is_structural |= is_large_wall_surface
 
-        is_structural = is_floor | is_wall
         fg_indices = np.where(~is_structural)[0]
 
+        # If point cloud has no separate structural planes (e.g. synthetic test object), cluster all points
         if len(fg_indices) < self.min_points:
             fg_indices = np.arange(n_pts)
 
         fg_pts = pts[fg_indices]
-        fg_curvs = curvatures[fg_indices]
 
-        # ── 3. Tabletop Slicing (Separate discrete items on tables) ───────────
+        # ── 3. Tabletop Slicing (Separate discrete items resting on tables) ───
         tabletop_proposals: List[np.ndarray] = []
         if plane_data and "tables" in plane_data:
             for t_plane in plane_data["tables"]:
@@ -605,25 +787,24 @@ class OpenMask3DProposalGenerator:
                 )
                 tt_idx = np.where(in_tt)[0]
                 if len(tt_idx) >= self.min_points:
-                    db_tt = DBSCAN(eps=0.06, min_samples=4).fit(pts[tt_idx])
+                    db_tt = DBSCAN(eps=0.05, min_samples=4).fit(pts[tt_idx])
                     for tt_lab in np.unique(db_tt.labels_):
                         if tt_lab >= 0:
                             cand_tt = tt_idx[db_tt.labels_ == tt_lab]
-                            if len(cand_tt) >= self.min_points:
+                            if is_valid_3d_physical_object(pts[cand_tt], min_points=self.min_points, max_points=self.max_points):
                                 tabletop_proposals.append(cand_tt)
 
-        # ── 4. 3D Superpoint Graph & Euclidean Instance Mask Clustering ───────
+        # ── 4. Multi-Scale 3D Foreground Clustering ───────────────────────────
         candidate_proposals: List[np.ndarray] = list(tabletop_proposals)
 
-        # Multi-scale 3D clustering on foreground
         scales = [
-            max(0.05, self.eps * 0.8),
-            max(0.08, self.eps * 1.3),
-            max(0.12, self.eps * 2.0),
+            max(0.04, self.eps * 0.8),
+            max(0.06, self.eps * 1.2),
+            max(0.10, self.eps * 1.8),
         ]
 
         for s_eps in scales:
-            db = DBSCAN(eps=s_eps, min_samples=5, n_jobs=-1).fit(fg_pts)
+            db = DBSCAN(eps=s_eps, min_samples=6, n_jobs=-1).fit(fg_pts)
             labels = db.labels_
             valid = labels >= 0
             if not np.any(valid):
@@ -632,9 +813,8 @@ class OpenMask3DProposalGenerator:
             for lab, cnt in zip(unique_l, counts):
                 if cnt >= self.min_points:
                     cand_fg_idx = fg_indices[labels == lab]
-                    # Verify proposal forms a compact physical 3D object (not an infinite flat surface)
-                    bbox_dims = np.ptp(pts[cand_fg_idx], axis=0)
-                    if np.max(bbox_dims) <= 4.0:
+                    cand_pts = pts[cand_fg_idx]
+                    if is_valid_3d_physical_object(cand_pts, min_points=self.min_points, max_points=self.max_points):
                         candidate_proposals.append(cand_fg_idx)
 
         if not candidate_proposals:
@@ -642,7 +822,7 @@ class OpenMask3DProposalGenerator:
 
         # ── 5. Downward Contact Point / Leg Retrieval ─────────────────────────
         expanded_proposals: List[np.ndarray] = []
-        floor_indices = np.where(is_floor)[0] if np.any(is_floor) else np.array([], dtype=np.int64)
+        floor_indices = np.where(pts[:, 1] <= (floor_y + 0.04))[0] if floor_y is not None else np.array([], dtype=np.int64)
         floor_pts = pts[floor_indices] if len(floor_indices) > 0 else np.zeros((0, 3))
         floor_tree = cKDTree(floor_pts) if len(floor_pts) > 0 else None
 
@@ -674,7 +854,7 @@ class OpenMask3DProposalGenerator:
             else:
                 full_prop = prop_idx
 
-            if len(full_prop) >= self.min_points:
+            if is_valid_3d_physical_object(pts[full_prop], min_points=self.min_points, max_points=self.max_points):
                 expanded_proposals.append(full_prop)
 
         # ── 6. 3D Non-Maximum Suppression (3D IoU) ────────────────────────────
@@ -687,7 +867,7 @@ class OpenMask3DProposalGenerator:
                 intersection = len(prop_set & exist_set)
                 union = len(prop_set | exist_set)
                 iou = intersection / max(union, 1)
-                if iou > 0.60:
+                if iou > 0.55:
                     is_dup = True
                     break
             if not is_dup:
@@ -701,7 +881,7 @@ class OpenMask3DProposalGenerator:
 class OpenMask3DMultiViewCLIP:
     """
     Stage 2 & 3: Multi-View CLIP Feature Aggregation & Open-Vocabulary Zero-Shot Classification.
-    Uses OpenCLIP to embed mask-guided image crops and text queries.
+    Uses OpenCLIP to embed mask-guided image crops and text queries with background negative prompts.
     """
 
     def __init__(
@@ -836,27 +1016,35 @@ class OpenMask3DMultiViewCLIP:
 class OpenMask3DExtractor:
     """
     End-to-end 3D-First OpenMask3D Orchestrator:
-    Extracts 3D object instances directly from world_pointcloud.ply using 3D Class-Agnostic Masks
-    and multi-view OpenCLIP zero-shot classification.
+    Extracts 3D object instances directly from world_pointcloud.ply using 3D Class-Agnostic Masks,
+    Geometric Sanity Checking, Negative Background Prompt Filtering, and OpenCLIP Zero-Shot Matching.
     """
 
     def __init__(
         self,
         class_queries: Optional[List[str]] = None,
+        negative_queries: Optional[List[str]] = None,
         clip_model_name: str = getattr(config, "OPENMASK3D_CLIP_MODEL", "ViT-B/32"),
-        similarity_thresh: float = getattr(config, "OPENMASK3D_SIMILARITY_THRESH", 0.18),
+        similarity_thresh: float = getattr(config, "OPENMASK3D_SIMILARITY_THRESH", 0.22),
         top_k_views: int = getattr(config, "OPENMASK3D_TOP_K_VIEWS", 10),
-        min_points: int = getattr(config, "OPENMASK3D_MIN_POINTS", 30),
+        min_points: int = getattr(config, "OPENMASK3D_MIN_POINTS", 80),
+        max_points: int = getattr(config, "OPENMASK3D_MAX_POINTS", 35000),
     ):
         self.class_queries = class_queries or getattr(config, "OPENMASK3D_CLASSES", [
             "chair", "table", "desk", "sofa", "bed", "monitor", "laptop", "tv",
             "lamp", "plant", "refrigerator", "cabinet", "door", "window", "box"
         ])
+        self.negative_queries = negative_queries or getattr(config, "OPENMASK3D_NEGATIVE_PROMPTS", [
+            "a blank wall in a room", "a plain painted wall", "an empty wall",
+            "a floor carpet in an empty room", "plain floor tiles", "a blank floor",
+            "a blank room ceiling", "room corner wall intersection", "empty background"
+        ])
         self.similarity_thresh = similarity_thresh
         self.top_k_views = top_k_views
         self.min_points = min_points
+        self.max_points = max_points
 
-        self.proposal_gen = OpenMask3DProposalGenerator(min_points=min_points)
+        self.proposal_gen = OpenMask3DProposalGenerator(min_points=min_points, max_points=max_points)
         self.clip_engine = OpenMask3DMultiViewCLIP(clip_model_name=clip_model_name)
 
     def extract(
@@ -869,7 +1057,7 @@ class OpenMask3DExtractor:
         out_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """
-        Execute 100% 3D-First OpenMask3D Instance Extraction.
+        Execute 100% 3D-First OpenMask3D Instance Extraction with Negative Background Filtering.
         """
         out_dir = Path(out_dir) if out_dir else config.PROCESSED_DATA_DIR / "objects"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -878,9 +1066,14 @@ class OpenMask3DExtractor:
         proposals = self.proposal_gen.generate_proposals(world_pts, colors=world_cols, plane_data=plane_data)
         print(f"[OpenMask3D] Generated {len(proposals)} distinct 3D candidate mask proposals.")
 
-        # Encode text queries
-        print(f"[OpenMask3D] Encoding {len(self.class_queries)} open-vocabulary target classes...")
-        text_embeds = self.clip_engine.encode_text_queries(self.class_queries)  # (C, D)
+        # Encode positive text queries and negative background prompts
+        print(f"[OpenMask3D] Encoding {len(self.class_queries)} open-vocabulary target classes & {len(self.negative_queries)} negative background prompts...")
+        text_embeds = self.clip_engine.encode_text_queries(self.class_queries)  # (C_pos, D)
+        neg_embeds = self.clip_engine.encode_text_queries(self.negative_queries)  # (C_neg, D)
+
+        floor_y = None
+        if plane_data and "floor" in plane_data:
+            floor_y = float(plane_data["floor"].get("mean_y", 0.0))
 
         frame_keys = [k for k in raw_depths_data.keys() if k.startswith("rgb_")] if hasattr(raw_depths_data, "keys") else []
         frame_indices = sorted([int(k.split("_")[1]) for k in frame_keys])
@@ -895,6 +1088,10 @@ class OpenMask3DExtractor:
 
             prop_pts = world_pts[mask_indices]
             prop_cols = world_cols[mask_indices] if world_cols is not None else None
+
+            # Physical 3D Object Geometry Validation (Reject wall/floor slabs)
+            if not is_valid_3d_physical_object(prop_pts, min_points=self.min_points, max_points=self.max_points):
+                continue
 
             # Collect multi-view mask-guided image crops for this 3D proposal
             crops_list: List[np.ndarray] = []
@@ -975,15 +1172,29 @@ class OpenMask3DExtractor:
                 mask_3d_feat = np.zeros(text_embeds.shape[1], dtype=np.float32)
 
             if np.linalg.norm(mask_3d_feat) > 1e-6:
-                sims = text_embeds @ mask_3d_feat
-                best_cls_idx = int(np.argmax(sims))
-                best_sim = float(sims[best_cls_idx])
+                # Positive similarities
+                sims_pos = text_embeds @ mask_3d_feat
+                best_cls_idx = int(np.argmax(sims_pos))
+                best_sim = float(sims_pos[best_cls_idx])
                 best_label = self.class_queries[best_cls_idx]
+
+                # Negative background similarities (Reject wall/floor background crops)
+                sims_neg = neg_embeds @ mask_3d_feat
+                max_neg_sim = float(np.max(sims_neg))
+
+                # If background wall/floor score is higher than positive object score, reject!
+                if max_neg_sim >= best_sim or (best_sim - max_neg_sim) < 0.010:
+                    continue
             else:
                 best_sim = self.similarity_thresh + 0.05
                 best_label = "object"
 
+            # Threshold check
             if best_sim < self.similarity_thresh:
+                continue
+
+            # Semantic-Geometric Consistency Check (Reject physically impossible labels)
+            if not validate_geometric_class_consistency(best_label, prop_pts, floor_y=floor_y):
                 continue
 
             obj_counter += 1
@@ -1044,6 +1255,7 @@ class OpenMask3DExtractor:
 
         print(f"[OpenMask3D] Extraction complete: {len(extracted_objects)} 3D objects segmented -> {extracted_manifest_path}")
         return extracted_objects
+
 
 
 

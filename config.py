@@ -80,12 +80,20 @@ OPENMASK3D_FOUNDATION_WEIGHTS= "yolov8x-worldv2.pt" # Pretrained weights for Kag
 OPENMASK3D_FOUNDATION_CONF   = 0.15        # Minimum confidence for 2D object detection
 OPENMASK3D_CLIP_MODEL        = "ViT-B/32"  # Pretrained CLIP model: "ViT-B/32", "ViT-L/14", "ViT-L/14@336px"
 OPENMASK3D_CLIP_PRETRAINED   = "openai"    # CLIP pretrained weights source (or "laion2b_s34b_b79k")
-OPENMASK3D_SIMILARITY_THRESH = 0.18        # Minimum cosine similarity threshold for zero-shot text-mask matching
-OPENMASK3D_MIN_POINTS        = 30          # Minimum point count for a valid 3D object instance
+OPENMASK3D_SIMILARITY_THRESH = 0.22        # Minimum cosine similarity threshold for zero-shot text-mask matching
+OPENMASK3D_MIN_POINTS        = 80          # Minimum point count for a valid 3D object instance
+OPENMASK3D_MAX_POINTS        = 35000       # Maximum point count for a single standalone physical object
 OPENMASK3D_TOP_K_VIEWS       = 10          # Number of best camera viewpoints to aggregate CLIP embeddings per mask
 OPENMASK3D_VOXEL_SIZE        = 0.02        # Voxel grid size (m) for 3D mask proposal downsampling
 OPENMASK3D_PROPOSAL_EPS      = 0.06        # Neighborhood distance for 3D point grouping proposals (m)
 OPENMASK3D_MAX_PROPOSALS     = 60          # Maximum 3D candidate proposals to process
+
+OPENMASK3D_NEGATIVE_PROMPTS  = [           # Background room structures to reject wall/floor/ceiling patches
+    "a blank wall in a room", "a plain painted wall", "an empty wall",
+    "a floor carpet in an empty room", "plain floor tiles", "a blank floor",
+    "a blank room ceiling", "room corner wall intersection", "empty background"
+]
+
 
 OPENMASK3D_CLASSES           = [           # Open-vocabulary target indoor / scene classes
     "chair", "armchair", "office chair", "swivel chair", "stool",
