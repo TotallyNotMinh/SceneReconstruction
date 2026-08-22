@@ -1217,9 +1217,9 @@ class TestSpatialPhase2AObjectExtractor(unittest.TestCase):
         self.assertEqual(len(clean_pts), 80)
         self.assertTrue(np.all(clean_cols[:, 0] < 50))
 
-    def test_openmask3d_structural_plane_and_multi_object_segmentation(self):
+    def test_mask3d_structural_plane_and_multi_object_segmentation(self):
         """
-        Verify that OpenMask3D with structural plane awareness cleanly separates
+        Verify that Mask3D with structural plane awareness cleanly separates
         floor-connected furniture (chair) and tabletop objects (laptop on table) into distinct proposals.
         """
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1282,7 +1282,7 @@ class TestSpatialPhase2AObjectExtractor(unittest.TestCase):
             ext_0 = np.eye(4, dtype=np.float64)
             np.savez(str(npz_path), rgb_0=rgb_0, depth_0=depth_0, ixt_0=ixt_0, ext_0=ext_0)
 
-            # Run Autonomous OpenMask3D extraction with plane metadata
+            # Run Autonomous Mask3D extraction with plane metadata
             results = extract_object_pointclouds(
                 world_pcd_path=pcd_path,
                 raw_depths_path=npz_path,

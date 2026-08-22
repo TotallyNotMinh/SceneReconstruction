@@ -74,38 +74,45 @@ OBJECT_COLOR_MASK_SAMPLE_COUNT = 300  # Number of pixels to sample from 2D mask 
 ENABLE_SUPPORT_PLANE_COLOR_CONTRAST = True # Prune base contact points whose color matches underlying plane
 OBJECT_COLOR_WEIGHT_IN_DBSCAN = 0.0025 # Color distance weighting factor in 6D XYZ+CIELAB DBSCAN clustering
 
-# ── OpenMask3D: Open-Vocabulary 3D Instance Segmentation ──────────────────────
-OPENMASK3D_FOUNDATION_MODEL  = "yolo-world" # 2D Foundation model: "yolo-world", "sam", "grounding-dino", "auto"
-OPENMASK3D_FOUNDATION_WEIGHTS= "yolov8x-worldv2.pt" # Pretrained weights for Kaggle GPU
-OPENMASK3D_FOUNDATION_CONF   = 0.15        # Minimum confidence for 2D object detection
-OPENMASK3D_CLIP_MODEL        = "ViT-B/32"  # Pretrained CLIP model: "ViT-B/32", "ViT-L/14", "ViT-L/14@336px"
-OPENMASK3D_CLIP_PRETRAINED   = "openai"    # CLIP pretrained weights source (or "laion2b_s34b_b79k")
-OPENMASK3D_SIMILARITY_THRESH = 0.22        # Minimum cosine similarity threshold for zero-shot text-mask matching
-OPENMASK3D_MIN_POINTS        = 80          # Minimum point count for a valid 3D object instance
-OPENMASK3D_MAX_POINTS        = 35000       # Maximum point count for a single standalone physical object
-OPENMASK3D_TOP_K_VIEWS       = 10          # Number of best camera viewpoints to aggregate CLIP embeddings per mask
-OPENMASK3D_VOXEL_SIZE        = 0.02        # Voxel grid size (m) for 3D mask proposal downsampling
-OPENMASK3D_PROPOSAL_EPS      = 0.06        # Neighborhood distance for 3D point grouping proposals (m)
-OPENMASK3D_MAX_PROPOSALS     = 60          # Maximum 3D candidate proposals to process
+# ── Mask3D: Deep 3D Instance Segmentation (JonasSchult/Mask3D) ──────────────
+MASK3D_CHECKPOINT_PATH       = WEIGHTS_DIR / "mask3d_scannet200_benchmark.ckpt" # Pretrained weights for Kaggle GPU
+MASK3D_DATASET               = "scannet200" # Target dataset benchmark: "scannet200" or "scannet"
+MASK3D_CONFIDENCE_THRESH     = 0.20        # Minimum query confidence threshold for instance detection
+MASK3D_VOXEL_SIZE            = 0.02        # Minkowski sparse voxel grid resolution (m) (2cm)
+MASK3D_MIN_POINTS            = 50          # Minimum point count for a valid 3D object instance
+MASK3D_MAX_POINTS            = 50000       # Maximum point count for an object cluster
+MASK3D_PREDICTIONS_PATH      = None        # Optional path to precomputed mask3d_predictions.json/.npz from Kaggle
 
-OPENMASK3D_NEGATIVE_PROMPTS  = [           # Background room structures to reject wall/floor/ceiling patches
-    "a blank wall in a room", "a plain painted wall", "an empty wall",
-    "a floor carpet in an empty room", "plain floor tiles", "a blank floor",
-    "a blank room ceiling", "room corner wall intersection", "empty background"
+# ScanNet200 Categories (200 fine-grained indoor object classes)
+SCANNET200_CLASSES = [
+    "wall", "floor", "cabinet", "bed", "chair", "sofa", "table", "door", "window",
+    "bookshelf", "picture", "counter", "desk", "curtain", "refrigerator", "shower curtain",
+    "toilet", "sink", "bathtub", "otherfurniture", "trash can", "pillow", "monitor", "lamp",
+    "keyboard", "laptop", "mouse", "bottle", "cup", "mug", "box", "backpack", "bag",
+    "book", "plant", "potted plant", "clock", "microwave", "oven", "stove", "toaster",
+    "towel", "mirror", "television", "nightstand", "cushion", "wardrobe", "stool", "ottoman",
+    "armchair", "coffee table", "dining table", "office chair", "swivel chair", "drawer",
+    "shelf", "cupboard", "vase", "flower", "bowl", "plate", "radiator", "printer", "speaker",
+    "rack", "hanger", "shoes", "clothes", "blanket", "curtain rod", "blinds", "guitar",
+    "piano", "whiteboard", "bulletin board", "calendar", "poster", "fan", "air conditioner",
+    "vacuum cleaner", "iron", "ironing board", "cutting board", "pan", "pot", "kettle",
+    "blender", "scale", "soap dispenser", "tissue box", "paper towel", "sponge", "broom",
+    "mop", "bucket", "ladder", "umbrella", "suitcase", "briefcase", "purse", "hat", "cap",
+    "helmet", "gloves", "scarf", "coat", "jacket", "shirt", "pants", "dress", "skirt",
+    "teddy bear", "toy", "game controller", "headphone", "earphone", "cell phone", "phone",
+    "tablet", "remote control", "mouse pad", "pen", "pencil", "stapler", "scissors", "tape",
+    "folder", "binder", "notebook", "envelope", "paper", "tray", "basket", "bin", "storage bin",
+    "tool box", "dumbbell", "yoga mat", "candle", "candle holder", "statue", "sculpture",
+    "framed photo", "certificate", "trophy", "medal", "placemat", "coaster", "tablecloth",
+    "napkin", "chopsticks", "fork", "knife", "spoon", "glass", "wine glass", "beer bottle",
+    "can", "jar", "jug", "thermos", "pitcher", "teapot", "coffee maker", "coffee grinder",
+    "cutting knife", "spatula", "whisk", "grater", "colander", "bowl set", "dish rack"
 ]
 
-
-OPENMASK3D_CLASSES           = [           # Open-vocabulary target indoor / scene classes
-    "chair", "armchair", "office chair", "swivel chair", "stool",
-    "table", "desk", "coffee table", "dining table", "nightstand",
-    "sofa", "couch", "cushion", "bed", "mattress",
-    "monitor", "computer", "laptop", "tv", "screen", "keyboard", "mouse",
-    "lamp", "floor lamp", "desk lamp", "light",
-    "plant", "potted plant", "vase", "flower",
-    "refrigerator", "microwave", "oven", "sink", "trash can", "bin",
-    "cabinet", "shelf", "bookshelf", "drawer", "wardrobe", "cupboard",
-    "door", "window", "curtain", "blind",
-    "box", "backpack", "bag", "pillow", "book", "bottle", "cup", "mug"
+SCANNET_CLASSES = [
+    "wall", "floor", "cabinet", "bed", "chair", "sofa", "table", "door", "window",
+    "bookshelf", "picture", "counter", "desk", "curtain", "refrigerator", "shower curtain",
+    "toilet", "sink", "bathtub", "otherfurniture"
 ]
 
 # ── Point Cloud Completion (PoinTr Transformer) ──────────────────────────────
