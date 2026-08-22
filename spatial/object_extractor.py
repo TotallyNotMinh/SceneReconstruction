@@ -2,12 +2,13 @@
 """
 spatial/object_extractor.py — Phase 2A: Mask3D (JonasSchult/Mask3D) 3D Instance Segmentation.
 
-Extracts exact 3D point cloud clusters for physical object instances directly from world_pointcloud.ply
-using Mask3D (Deep 3D Instance Segmentation with Sparse Convolutions & Transformer Query Decoder):
+Extracts exact 3D point cloud clusters for EVERY physical object instance in the room
+directly from world_pointcloud.ply:
 - Runs Minkowski sparse 3D convolutional backbone + Transformer Query Decoder on point cloud geometry.
 - Predicts binary 3D instance masks and semantic class categories from ScanNet200 (200 indoor object types).
 - Slices exact inlier vertices and colors from world_pointcloud.ply (zero synthetic/interpolated points).
-- Supports direct Kaggle GPU neural inference, loading precomputed mask files, and 2D detection guidance.
+- Outputs individual point clouds: obj_001_table_pointcloud.ply, obj_002_chair_pointcloud.ply, etc.
+- Supports direct Kaggle GPU neural inference, precomputed mask loading, and structural plane subtraction.
 """
 
 import sys
@@ -156,6 +157,88 @@ def filter_object_pointcloud_dbscan(
 
 
 # ==============================================================================
+# ==================== STRUCTURAL PLANE FILTERING ==============================
+# ==============================================================================
+
+def _filter_plane_inliers(
+    pts: np.ndarray,
+    cols: Optional[np.ndarray],
+    label: str,
+    plane_data: Optional[Dict[str, Any]],
+    distance_threshold: float = 0.03,
+    **kwargs,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Remove architectural plane inliers from an extracted object cluster."""
+    if len(pts) == 0 or not plane_data:
+        return pts, cols
+
+    margin = kwargs.get("margin", distance_threshold)
+    keep_mask = np.ones(len(pts), dtype=bool)
+
+    floor = plane_data.get("floor")
+    if floor:
+        floor_y = float(floor.get("mean_y", 0.0))
+        on_floor = pts[:, 1] <= (floor_y + margin)
+        keep_mask = keep_mask & ~on_floor
+
+    tables = plane_data.get("tables", [])
+    for table in tables:
+        t_y = float(table.get("mean_y", 0.0))
+        on_table = np.abs(pts[:, 1] - t_y) <= margin
+        keep_mask = keep_mask & ~on_table
+
+    if not np.any(keep_mask):
+        return pts, cols
+
+    return pts[keep_mask], (cols[keep_mask] if cols is not None else None)
+
+
+def remove_room_boundary_planes(
+    pts: np.ndarray,
+    colors: Optional[np.ndarray],
+    plane_data: Optional[Dict[str, Any]] = None,
+    floor_margin: float = 0.04,
+    wall_margin: float = 0.05,
+    ceiling_margin: float = 0.05,
+) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+    """
+    Subtractive filtering of room background (floor, ceiling, outer walls)
+    to isolate true foreground objects for 3D instance segmentation.
+    """
+    n_pts = len(pts)
+    keep = np.ones(n_pts, dtype=bool)
+
+    # 1. Plane data provided
+    if plane_data:
+        floor = plane_data.get("floor")
+        if floor:
+            floor_y = float(floor.get("mean_y", pts[:, 1].min()))
+            keep = keep & (pts[:, 1] > (floor_y + floor_margin))
+
+        for c in plane_data.get("ceilings", []):
+            c_y = float(c.get("mean_y", pts[:, 1].max()))
+            keep = keep & (pts[:, 1] < (c_y - ceiling_margin))
+
+        for w in plane_data.get("walls", []):
+            if "equation" in w:
+                eq = np.array(w["equation"], dtype=np.float64)
+                dist = np.abs(pts @ eq[:3] + eq[3])
+                keep = keep & (dist > wall_margin)
+    else:
+        # Fallback bounding height slice
+        y_min = float(pts[:, 1].min())
+        y_max = float(pts[:, 1].max())
+        if (y_max - y_min) > 0.4:
+            keep = keep & (pts[:, 1] > (y_min + floor_margin)) & (pts[:, 1] < (y_max - ceiling_margin))
+
+    if np.sum(keep) < 20:
+        keep = np.ones(n_pts, dtype=bool)
+
+    indices = np.where(keep)[0]
+    return pts[keep], (colors[keep] if colors is not None else None), indices
+
+
+# ==============================================================================
 # ==================== MASK3D PREPROCESSING & INFERENCE ENGINE =================
 # ==============================================================================
 
@@ -175,23 +258,16 @@ class Mask3DPreprocessor:
     ) -> Tuple[Any, np.ndarray, np.ndarray]:
         """
         Voxelize point cloud for Mask3D Minkowski sparse convolution backbone.
-
-        Returns
-        -------
-        (sparse_input, unique_voxels, inv_indices)
         """
         n_pts = len(pts)
         if colors is None or len(colors) != n_pts:
             feats = np.zeros((n_pts, 3), dtype=np.float32)
         else:
-            # Normalize RGB [0, 255] -> [-1.0, 1.0] (ScanNet standard)
             feats = (colors.astype(np.float32) / 127.5) - 1.0
 
-        # Integer grid coordinates
         voxel_coords = np.floor(pts / self.voxel_size).astype(np.int32)
         unique_voxels, inv_indices = np.unique(voxel_coords, axis=0, return_inverse=True)
 
-        # Aggregate features per unique voxel cell
         m_voxels = len(unique_voxels)
         counts = np.bincount(inv_indices, minlength=m_voxels)[:, None]
         feat_sum = np.zeros((m_voxels, 3), dtype=np.float32)
@@ -242,7 +318,6 @@ class Mask3DRunner:
 
         try:
             print(f"[Mask3D] Loading official Mask3D model from '{self.checkpoint_path}' on {self.device}...")
-            # Attempt 1: JonasSchult/Mask3D get_model API if installed in environment
             try:
                 from mask3d import get_model
                 self.model = get_model(checkpoint_path=str(self.checkpoint_path))
@@ -252,7 +327,6 @@ class Mask3DRunner:
             except (ImportError, Exception):
                 pass
 
-            # Attempt 2: PyTorch Lightning checkpoint load
             ckpt = torch.load(str(self.checkpoint_path), map_location=self.device)
             if isinstance(ckpt, dict) and "state_dict" in ckpt:
                 self.model = ckpt["state_dict"]
@@ -270,9 +344,10 @@ class Mask3DRunner:
         self,
         pts: np.ndarray,
         colors: Optional[np.ndarray] = None,
+        plane_data: Optional[Dict[str, Any]] = None,
         confidence_thresh: float = getattr(config, "MASK3D_CONFIDENCE_THRESH", 0.20),
-        min_points: int = getattr(config, "MASK3D_MIN_POINTS", 50),
-        max_points: int = getattr(config, "MASK3D_MAX_POINTS", 50000),
+        min_points: int = getattr(config, "MASK3D_MIN_POINTS", 30),
+        max_points: int = getattr(config, "MASK3D_MAX_POINTS", 100000),
     ) -> List[Dict[str, Any]]:
         """
         Run 3D Instance Segmentation on point cloud.
@@ -312,7 +387,7 @@ class Mask3DRunner:
                 results = []
                 for q_idx in range(len(masks_prob)):
                     cls_probs = scores_cls[q_idx]
-                    best_cls_idx = int(np.argmax(cls_probs[:-1]))  # Exclude background null class
+                    best_cls_idx = int(np.argmax(cls_probs[:-1]))
                     score = float(cls_probs[best_cls_idx])
 
                     if score < confidence_thresh:
@@ -320,11 +395,10 @@ class Mask3DRunner:
 
                     label = self.class_labels[best_cls_idx] if best_cls_idx < len(self.class_labels) else "object"
 
-                    # Skip background structural planes (wall, floor, ceiling)
+                    # Skip background structural planes
                     if label.lower() in ("wall", "floor", "ceiling", "otherfurniture"):
                         continue
 
-                    # Un-voxelize mask back to all original N points
                     voxel_mask = masks_prob[q_idx] > 0.5
                     full_mask = voxel_mask[inv_indices]
                     cnt = int(np.sum(full_mask))
@@ -343,59 +417,51 @@ class Mask3DRunner:
                 print(f"[Mask3D] Forward pass exception ({e}); running geometric fallback.")
 
         # 2. Geometric Separation Fallback (for local CPU test suite / machines without CUDA)
-        return self._run_geometric_fallback(pts, colors, min_points, max_points)
+        return self._run_geometric_fallback(pts, colors, plane_data, min_points, max_points)
 
     def _run_geometric_fallback(
         self,
         pts: np.ndarray,
         colors: Optional[np.ndarray],
+        plane_data: Optional[Dict[str, Any]],
         min_points: int,
         max_points: int,
     ) -> List[Dict[str, Any]]:
         """
-        Lightweight fallback to ensure test suites and local CPU runs execute seamlessly.
+        Separates all individual physical objects (tables, chairs, desk, monitor/tv, etc.)
+        from the point cloud after subtracting room boundary planes.
         """
         n_pts = len(pts)
         if n_pts < min_points:
             return []
 
-        # Check for planar floor
-        y_min = float(np.min(pts[:, 1]))
-        y_max = float(np.max(pts[:, 1]))
-        y_span = y_max - y_min
+        # Step 1: Remove floor, ceiling, and wall planes
+        fg_pts, fg_cols, fg_indices = remove_room_boundary_planes(pts, colors, plane_data)
+        if len(fg_pts) < min_points:
+            fg_pts = pts
+            fg_indices = np.arange(n_pts)
 
-        # If substantial height span, separate floor slice
-        if y_span > 0.3:
-            fg_mask = pts[:, 1] > (y_min + 0.03)
-        else:
-            fg_mask = np.ones(n_pts, dtype=bool)
-
-        if np.sum(fg_mask) < min_points:
-            fg_mask = np.ones(n_pts, dtype=bool)
-
-        fg_indices = np.where(fg_mask)[0]
-        fg_pts = pts[fg_indices]
-
-        # Multi-scale clustering
-        candidate_labels = []
-        for eps_cand in [0.06, 0.12, 0.25]:
+        # Step 2: Multi-Scale Adaptive Clustering
+        candidate_clusters = []
+        for eps_cand in [0.04, 0.08, 0.14, 0.22]:
             db = DBSCAN(eps=eps_cand, min_samples=3).fit(fg_pts)
             valid = db.labels_ >= 0
             if np.any(valid):
                 u_labs, counts = np.unique(db.labels_[valid], return_counts=True)
                 for l_val, c_val in zip(u_labs, counts):
                     if min_points <= c_val <= max_points:
-                        candidate_labels.append(fg_indices[db.labels_ == l_val])
+                        inlier_sub_idx = np.where(db.labels_ == l_val)[0]
+                        candidate_clusters.append(fg_indices[inlier_sub_idx])
 
-        # Deduplicate candidates by IoU
+        # Step 3: Non-Maximum Suppression (NMS) on 3D Object Clusters
         unique_instances = []
-        for cand_idx in sorted(candidate_labels, key=lambda c: -len(c)):
+        for cand_idx in sorted(candidate_clusters, key=lambda c: -len(c)):
             cand_set = set(cand_idx)
             is_dup = False
             for exist_set in unique_instances:
                 inter = len(cand_set & exist_set)
                 union = len(cand_set | exist_set)
-                if (inter / max(union, 1)) > 0.5:
+                if (inter / max(union, 1)) > 0.40:
                     is_dup = True
                     break
             if not is_dup:
@@ -408,17 +474,29 @@ class Mask3DRunner:
         for inst_set in unique_instances:
             cand_idx = np.array(list(inst_set), dtype=np.int64)
             cnt = len(cand_idx)
+            if cnt < min_points:
+                continue
+
             full_mask = np.zeros(n_pts, dtype=bool)
             full_mask[cand_idx] = True
 
-            # Guess basic category from bounding proportions
-            bbox = np.ptp(pts[cand_idx], axis=0)
-            if bbox[1] > 0.6:
+            # Semantic classification based on spatial dimensions & elevation
+            obj_pts_c = pts[cand_idx]
+            bbox = np.ptp(obj_pts_c, axis=0)  # (dx, dy, dz)
+            height_y = bbox[1]
+            max_horiz = max(bbox[0], bbox[2])
+            mean_y = float(obj_pts_c[:, 1].mean())
+
+            if height_y > 0.6 and max_horiz < 0.9:
                 lbl = "chair"
-            elif max(bbox[0], bbox[2]) > 0.7:
+            elif max_horiz > 0.7 and height_y < 1.2:
                 lbl = "table"
+            elif height_y < 0.4 and max_horiz > 0.5:
+                lbl = "table"
+            elif bbox[0] > 0.4 and bbox[1] > 0.3 and bbox[2] < 0.2:
+                lbl = "monitor"
             else:
-                lbl = "object"
+                lbl = "chair" if height_y > 0.5 else "object"
 
             instances.append({
                 "mask": full_mask,
@@ -437,7 +515,7 @@ class Mask3DRunner:
 class Mask3DExtractor:
     """
     End-to-End 3D Physical Object Instance Extractor using Mask3D:
-    Extracts high-fidelity point clouds for all detected 3D objects with exact coordinates and attributes.
+    Extracts individual point clouds for ALL physical objects in the scene.
     """
 
     def __init__(
@@ -445,8 +523,8 @@ class Mask3DExtractor:
         checkpoint_path: Optional[Union[Path, str]] = None,
         dataset: str = getattr(config, "MASK3D_DATASET", "scannet200"),
         confidence_thresh: float = getattr(config, "MASK3D_CONFIDENCE_THRESH", 0.20),
-        min_points: int = getattr(config, "MASK3D_MIN_POINTS", 50),
-        max_points: int = getattr(config, "MASK3D_MAX_POINTS", 50000),
+        min_points: int = getattr(config, "MASK3D_MIN_POINTS", 30),
+        max_points: int = getattr(config, "MASK3D_MAX_POINTS", 100000),
     ):
         self.confidence_thresh = confidence_thresh
         self.min_points = min_points
@@ -457,6 +535,7 @@ class Mask3DExtractor:
         self,
         world_pts: np.ndarray,
         world_cols: Optional[np.ndarray],
+        plane_data: Optional[Dict[str, Any]] = None,
         mask3d_predictions_path: Optional[Union[Path, str]] = None,
         out_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
@@ -490,7 +569,7 @@ class Mask3DExtractor:
                             })
                 elif pred_path.suffix.lower() == ".npz":
                     data = np.load(str(pred_path))
-                    masks = data["masks"]  # (N_inst, N_pts)
+                    masks = data["masks"]
                     labels = data.get("labels", ["object"] * len(masks))
                     scores = data.get("scores", [1.0] * len(masks))
                     for m, l, s in zip(masks, labels, scores):
@@ -508,6 +587,7 @@ class Mask3DExtractor:
             instances = self.runner.run_inference(
                 pts=world_pts,
                 colors=world_cols,
+                plane_data=plane_data,
                 confidence_thresh=self.confidence_thresh,
                 min_points=self.min_points,
                 max_points=self.max_points,
@@ -608,7 +688,6 @@ def extract_object_points_from_world_pcd_view(
 ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """
     Auxiliary projection utility: project world points onto a 2D camera mask view.
-    Maintains depth consistency and CIELAB color gating.
     """
     if len(world_pts) == 0 or mask_2d is None:
         return np.zeros((0, 3)), (np.zeros((0, 3), dtype=np.uint8) if world_cols is not None else None), np.zeros(0, dtype=np.int64)
@@ -646,7 +725,6 @@ def extract_object_points_from_world_pcd_view(
     if len(mask_indices) == 0:
         return np.zeros((0, 3)), (np.zeros((0, 3), dtype=np.uint8) if world_cols is not None else None), np.zeros(0, dtype=np.int64)
 
-    # Depth verification if depth_map is provided
     if depth_map is not None:
         meas_z = depth_map[v[mask_indices], u[mask_indices]]
         valid_meas = np.isfinite(meas_z) & (meas_z > 0.1)
@@ -662,7 +740,6 @@ def extract_object_points_from_world_pcd_view(
     else:
         final_indices = mask_indices
 
-    # Color consistency filtering
     eff_color_filter = kwargs.get("enable_color_filter", enable_color_filter)
     eff_rgb_frame = kwargs.get("rgb_frame", rgb_frame)
     eff_max_delta_e = kwargs.get("color_delta_e_max", color_delta_e_max)
@@ -698,39 +775,6 @@ def _build_2d_mask(view: Dict[str, Any], H: int, W: int) -> np.ndarray:
         xmin, ymin, xmax, ymax = map(int, bbox[:4]) if len(bbox) >= 4 else (0, 0, W, H)
         mask_2d[max(0, ymin):min(H, ymax), max(0, xmin):min(W, xmax)] = 255
     return mask_2d
-
-
-def _filter_plane_inliers(
-    pts: np.ndarray,
-    cols: Optional[np.ndarray],
-    label: str,
-    plane_data: Optional[Dict[str, Any]],
-    distance_threshold: float = 0.03,
-    **kwargs,
-) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """Remove architectural plane inliers from an extracted object cluster."""
-    if len(pts) == 0 or not plane_data:
-        return pts, cols
-
-    margin = kwargs.get("margin", distance_threshold)
-    keep_mask = np.ones(len(pts), dtype=bool)
-
-    floor = plane_data.get("floor")
-    if floor:
-        floor_y = float(floor.get("mean_y", 0.0))
-        on_floor = pts[:, 1] <= (floor_y + margin)
-        keep_mask = keep_mask & ~on_floor
-
-    tables = plane_data.get("tables", [])
-    for table in tables:
-        t_y = float(table.get("mean_y", 0.0))
-        on_table = np.abs(pts[:, 1] - t_y) <= margin
-        keep_mask = keep_mask & ~on_table
-
-    if not np.any(keep_mask):
-        return pts, cols
-
-    return pts[keep_mask], (cols[keep_mask] if cols is not None else None)
 
 
 def backproject_mask_to_3d(
@@ -800,7 +844,7 @@ def extract_object_pointclouds(
 ) -> Dict[str, Any]:
     """
     Main Mask3D Object Point Cloud Extraction Entrypoint.
-    Runs standalone with ONLY world_pointcloud.ply on Kaggle GPU.
+    Extracts individual point clouds for ALL physical objects in the room.
     """
     # 1. Check file existence if paths explicitly provided
     if detections_path is not None:
@@ -840,7 +884,6 @@ def extract_object_pointclouds(
         print(f"[Mask3D] Loading world point cloud from '{world_pcd_path.name}'...")
         world_pts, world_cols = load_world_pointcloud(world_pcd_path)
     elif raw_depths_path and Path(raw_depths_path).exists():
-        # Fallback build points from depth maps in npz
         npz_temp = dict(np.load(str(raw_depths_path)))
         p_list = []
         c_list = []
@@ -865,7 +908,24 @@ def extract_object_pointclouds(
     has_color_str = f"with RGB colors ({len(world_cols):,} pts)" if world_cols is not None else "uncolored"
     print(f"[Mask3D] Loaded {len(world_pts):,} points ({has_color_str}).")
 
-    # Mode 1: 2D Detection-Guided Extraction (if 2D detections are explicitly provided)
+    # Load plane metadata if present
+    plane_data = None
+    if plane_data_path and Path(plane_data_path).exists():
+        try:
+            with open(plane_data_path, "r", encoding="utf-8") as pf:
+                plane_data = json.load(pf)
+        except Exception:
+            plane_data = None
+    elif world_pcd_path:
+        cand_plane = world_pcd_path.parent / "detected_planes.json"
+        if cand_plane.exists():
+            try:
+                with open(cand_plane, "r", encoding="utf-8") as pf:
+                    plane_data = json.load(pf)
+            except Exception:
+                plane_data = None
+
+    # Mode 1: 2D Detection-Guided Extraction (ONLY if 2D detections are explicitly provided)
     detections_data = {}
     if detections_path is not None and Path(detections_path).exists():
         try:
@@ -970,11 +1030,12 @@ def extract_object_pointclouds(
             json.dump(extracted_objects, f, indent=2)
         return extracted_objects
 
-    # Mode 2: Standalone Mask3D Neural Segmentation
+    # Mode 2: Standalone Mask3D 3D Instance Segmentation on world_pointcloud.ply
     extractor = Mask3DExtractor(checkpoint_path=checkpoint_path)
     return extractor.extract(
         world_pts=world_pts,
         world_cols=world_cols,
+        plane_data=plane_data,
         mask3d_predictions_path=mask3d_predictions_path,
         out_dir=out_dir,
     )
@@ -1021,6 +1082,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 2A: Mask3D (JonasSchult/Mask3D) 3D Instance Segmentation")
     parser.add_argument("--world-pcd", type=str, default=str(config.PROCESSED_DATA_DIR / "world_pointcloud.ply"),
                         help="Path to world_pointcloud.ply file")
+    parser.add_argument("--planes-json", type=str, default=str(config.PROCESSED_DATA_DIR / "detected_planes.json"),
+                        help="Path to detected_planes.json file")
     parser.add_argument("--checkpoint", type=str, default=str(config.MASK3D_CHECKPOINT_PATH),
                         help="Path to Mask3D checkpoint file (.ckpt)")
     parser.add_argument("--predictions", type=str, default=None,
@@ -1031,6 +1094,7 @@ if __name__ == "__main__":
 
     extract_object_pointclouds(
         world_pcd_path=args.world_pcd,
+        plane_data_path=args.planes_json,
         checkpoint_path=args.checkpoint,
         mask3d_predictions_path=args.predictions,
         out_dir=args.out_dir,

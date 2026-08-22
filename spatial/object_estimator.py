@@ -2,10 +2,11 @@
 """
 spatial/object_estimator.py — Unified Phase 2 3D Object Reconstruction Pipeline.
 
-Orchestrates Phase 2A (spatial/object_extractor.py) and Phase 2B (spatial/object_mesher.py)
-for complete end-to-end 3D point cloud extraction and surface mesh reconstruction.
+Orchestrates Phase 2A (spatial/object_extractor.py: Mask3D 3D Instance Segmentation),
+Phase 2A+ (spatial/pointcloud_completer.py: PoinTr Shape Completion), and
+Phase 2B (spatial/object_mesher.py: 3D Surface Meshing).
 
-Maintains 100% backward compatibility for existing callers and test suites.
+Extracts individual point clouds for ALL physical objects in the room directly from world_pointcloud.ply.
 """
 
 import sys
@@ -14,7 +15,7 @@ import argparse
 import numpy as np
 import cv2
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +25,8 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 
 from spatial.object_extractor import (
+    Mask3DExtractor,
+    Mask3DRunner,
     ObjectExtractor,
     extract_object_pointclouds,
     extract_object_points_from_world_pcd_view,
@@ -44,7 +47,6 @@ from spatial.object_mesher import (
     reconstruct_object_mesh,
     reconstruct_object_meshes,
 )
-
 
 # Backward compatibility alias
 reconstruct_object_mesh_alpha_shape = reconstruct_object_mesh
@@ -112,25 +114,29 @@ def backproject_mask_to_3d(
 
 
 def process_object_detections(
-    detections_path: Optional[Path | str] = None,
-    raw_depths_path: Optional[Path | str] = None,
-    ar_metadata_path: Optional[Path | str] = None,
-    world_pcd_path: Optional[Path | str] = None,
-    plane_data_path: Optional[Path | str] = None,
-    out_dir: Optional[Path | str] = None,
+    detections_path: Optional[Union[Path, str]] = None,
+    raw_depths_path: Optional[Union[Path, str]] = None,
+    ar_metadata_path: Optional[Union[Path, str]] = None,
+    world_pcd_path: Optional[Union[Path, str]] = None,
+    plane_data_path: Optional[Union[Path, str]] = None,
+    out_dir: Optional[Union[Path, str]] = None,
     filter_planes: bool = False,
+    mask3d_predictions_path: Optional[Union[Path, str]] = None,
+    checkpoint_path: Optional[Union[Path, str]] = None,
+    **kwargs,
 ) -> Dict[str, Any]:
     """
     Unified Phase 2 Pipeline:
-    1. Phase 2A: Exact Point Cloud Extraction (spatial/object_extractor.py)
-    2. Phase 2B: Surface Mesh Reconstruction (spatial/object_mesher.py)
+    1. Phase 2A: Mask3D Exact Point Cloud Instance Segmentation (spatial/object_extractor.py)
+    2. Phase 2A+: Point Cloud Shape Completion with PoinTr (spatial/pointcloud_completer.py)
+    3. Phase 2B: Surface Mesh Reconstruction (spatial/object_mesher.py)
     """
     if out_dir is None:
         out_dir = config.PROCESSED_DATA_DIR / "objects"
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[ObjectEstimator] Stage 2A: Extracting exact 3D point clouds for objects...")
+    print("[ObjectEstimator] Stage 2A: Extracting exact 3D point clouds for all objects via Mask3D...")
     extracted_manifest = extract_object_pointclouds(
         detections_path=detections_path,
         raw_depths_path=raw_depths_path,
@@ -139,11 +145,16 @@ def process_object_detections(
         plane_data_path=plane_data_path,
         out_dir=out_dir,
         filter_planes=filter_planes,
+        mask3d_predictions_path=mask3d_predictions_path,
+        checkpoint_path=checkpoint_path,
+        **kwargs,
     )
 
     if not extracted_manifest:
         print("[ObjectEstimator] No object point clouds extracted. Skipping completion and meshing stages.")
         return {}
+
+    print(f"[ObjectEstimator] Successfully extracted {len(extracted_manifest)} object point clouds.")
 
     # Stage 2A+: Point Cloud Shape Completion (PoinTr)
     if getattr(config, "ENABLE_POINTCLOUD_COMPLETION", True):
@@ -166,7 +177,6 @@ def process_object_detections(
         out_dir=out_dir,
     )
 
-
     return mesh_manifest
 
 
@@ -175,40 +185,53 @@ class ObjectEstimator:
 
     def __init__(
         self,
-        detections_path: Optional[Path | str] = None,
-        raw_depths_path: Optional[Path | str] = None,
-        ar_metadata_path: Optional[Path | str] = None,
-        world_pcd_path: Optional[Path | str] = None,
-        plane_data_path: Optional[Path | str] = None,
+        detections_path: Optional[Union[Path, str]] = None,
+        raw_depths_path: Optional[Union[Path, str]] = None,
+        ar_metadata_path: Optional[Union[Path, str]] = None,
+        world_pcd_path: Optional[Union[Path, str]] = None,
+        plane_data_path: Optional[Union[Path, str]] = None,
+        out_dir: Optional[Union[Path, str]] = None,
+        mask3d_predictions_path: Optional[Union[Path, str]] = None,
+        checkpoint_path: Optional[Union[Path, str]] = None,
     ):
-        self.detections_path = Path(detections_path) if detections_path else config.PROCESSED_DATA_DIR / "detections.json"
-        self.raw_depths_path = Path(raw_depths_path) if raw_depths_path is not None else None
-        self.ar_metadata_path = Path(ar_metadata_path) if ar_metadata_path else config.PROCESSED_DATA_DIR / "ar_metadata.json"
+        self.detections_path = Path(detections_path) if detections_path else None
+        self.raw_depths_path = Path(raw_depths_path) if raw_depths_path else None
+        self.ar_metadata_path = Path(ar_metadata_path) if ar_metadata_path else None
         self.world_pcd_path = Path(world_pcd_path) if world_pcd_path else config.PROCESSED_DATA_DIR / "world_pointcloud.ply"
         self.plane_data_path = Path(plane_data_path) if plane_data_path else config.PROCESSED_DATA_DIR / "detected_planes.json"
+        self.out_dir = Path(out_dir) if out_dir else config.PROCESSED_DATA_DIR / "objects"
+        self.mask3d_predictions_path = mask3d_predictions_path
+        self.checkpoint_path = checkpoint_path
 
     def run(self) -> Dict[str, Any]:
         return process_object_detections(
-            self.detections_path,
+            detections_path=self.detections_path,
             raw_depths_path=self.raw_depths_path,
             ar_metadata_path=self.ar_metadata_path,
             world_pcd_path=self.world_pcd_path,
             plane_data_path=self.plane_data_path,
+            out_dir=self.out_dir,
+            mask3d_predictions_path=self.mask3d_predictions_path,
+            checkpoint_path=self.checkpoint_path,
         )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Phase 2: Object 3D Point Cloud Extraction & Surface Meshing")
-    parser.add_argument("--detections", type=str, default=str(config.PROCESSED_DATA_DIR / "detections.json"),
-                        help="Path to detections.json file")
-    parser.add_argument("--depths", type=str, default=str(config.PROCESSED_DATA_DIR / "raw_depths.npz"),
-                        help="Path to raw_depths.npz file")
+    parser = argparse.ArgumentParser(description="Phase 2: Mask3D Object 3D Point Cloud Extraction & Surface Meshing")
     parser.add_argument("--world-pcd", type=str, default=str(config.PROCESSED_DATA_DIR / "world_pointcloud.ply"),
                         help="Path to world_pointcloud.ply file")
     parser.add_argument("--planes-json", type=str, default=str(config.PROCESSED_DATA_DIR / "detected_planes.json"),
                         help="Path to detected_planes.json file")
+    parser.add_argument("--checkpoint", type=str, default=str(config.MASK3D_CHECKPOINT_PATH),
+                        help="Path to Mask3D model checkpoint file (.ckpt)")
+    parser.add_argument("--predictions", type=str, default=None,
+                        help="Path to precomputed mask3d_predictions.json/.npz (optional)")
     parser.add_argument("--out-dir", type=str, default=str(config.PROCESSED_DATA_DIR / "objects"),
                         help="Output directory for reconstructed object 3D meshes")
+    parser.add_argument("--detections", type=str, default=None,
+                        help="Path to detections.json file (optional for 2D guidance)")
+    parser.add_argument("--depths", type=str, default=None,
+                        help="Path to raw_depths.npz file (optional)")
     args = parser.parse_args()
 
     process_object_detections(
@@ -216,5 +239,7 @@ if __name__ == "__main__":
         raw_depths_path=args.depths,
         world_pcd_path=args.world_pcd,
         plane_data_path=args.planes_json,
+        checkpoint_path=args.checkpoint,
+        mask3d_predictions_path=args.predictions,
         out_dir=args.out_dir,
     )
